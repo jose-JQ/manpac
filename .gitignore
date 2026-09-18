@@ -1,0 +1,21 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.python-version
+
+# Operación local y datos personales
+docs/
+revision_manual/
+procesados_exito/
+temp_uploads/
+temp_api_uploads/
+log_revision_fallos.txt
+reporte_extracciones.xlsx
+
+# Empaquetado
+*.zip
+entrega/
+.idea/
+.vscode/
+.streamlit/secrets.toml

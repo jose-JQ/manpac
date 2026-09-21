@@ -102,5 +102,6 @@ def verificar_carga():
 
 # Ejecución
 if __name__ == "__main__":
-    poblar_base_datos('ecuador.json')
-    verificar_carga()
+   # poblar_base_datos('ecuador.json')
+   # verificar_carga()
+   pass

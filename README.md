@@ -180,7 +180,7 @@ La primera vez que DocTR corre, **descarga pesos** (hace falta internet).
 | Programa | Para qué | Dónde |
 | --- | --- | --- |
 | **Ollama** | Corre los LLMs en local | https://ollama.com |
-| **Tesseract OCR** (idioma `spa`) | OCR de páginas escaneadas | https://github.com/UB-Mannheim/tesseract/wiki |
+| **Tesseract OCR** (idioma `spa`) | OCR de páginas escaneadas | https://github.com/UB-Mannheim/tesseract/wiki   https://drive.google.com/file/d/1Y9quvLPb6aXIrn81h7m_UNvah_Eh48uk/view?usp=sharing  |
 | **Poppler** | Convertir PDF a imagen | https://github.com/oschwartz10612/poppler-windows/releases |
 
 Modelos de Ollama que el pipeline espera:
@@ -265,3 +265,7 @@ Carpetas que se crean solas al procesar: `temp_api_uploads/`, `procesados_exito/
 - Vehículos que no existan en `vehiculos.db` (o con OCR muy pobre) salen como `REVISIÓN`.
 - Las rutas de Poppler/Tesseract están pensadas para Windows.
 - Los PDF de `docs/` son muestras de prueba, no plantillas: el extractor generaliza por roles y anclas, no por un diseño fijo.
+
+
+## Limitaciones
+Enlace de documentos de prueba: https://drive.google.com/file/d/1XIW_EGftxosJTgwKd1E8OlDa-6Of030a/view?usp=sharing

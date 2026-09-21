@@ -3,6 +3,7 @@ import re
 import json
 import shutil
 import time
+import unicodedata
 import numpy as np
 import pymupdf
 from pdf2image import convert_from_path
@@ -103,7 +104,7 @@ def _es_placeholder(val):
 def _tokens_vehiculo(texto):
     texto = str(texto or "").upper()
     texto = re.sub(r"\([^)]*\)", " ", texto)
-    texto = re.sub(r"[^A-Z0-9ÁÉÍÓÚÑ#+\- ]", " ", texto)
+    texto = re.sub(r"[^A-Z0-9ÁÉÍÓÚÑ#+ ]", " ", texto)
     tokens = []
     for t in texto.split():
         if t in SUFIJOS_TECNICOS:
@@ -129,7 +130,7 @@ def _similitud_nombres(tokens_a, tokens_b):
     return difflib.SequenceMatcher(None, sa, sb).ratio()
 
 
-def buscar_vehiculo_fuzzy(marca_buscada, modelo_buscado, umbral_total=0.80):
+def buscar_vehiculo_fuzzy(marca_buscada, modelo_buscado, umbral_total=0.90):
     if _es_placeholder(marca_buscada) and _es_placeholder(modelo_buscado):
         return None, None
 
@@ -158,12 +159,19 @@ def buscar_vehiculo_fuzzy(marca_buscada, modelo_buscado, umbral_total=0.80):
         sim_combo = _similitud_nombres(tokens_combo, tokens_marca_bd + tokens_mod_bd)
         sim_mod = max(sim_mod, _similitud_nombres(tokens_combo, tokens_mod_bd), sim_combo * 0.98)
 
-        if sim_mod < 0.72:
+        for ta in tokens_modelo:
+            for tb in tokens_mod_bd:
+                if len(ta) >= 4 and len(tb) >= 4:
+                    sim_mod = max(sim_mod, difflib.SequenceMatcher(None, ta, tb).ratio())
+
+        if sim_mod < 0.70:
             continue
 
         sim_total = (sim_marca * 0.4) + (sim_mod * 0.6)
         if sim_combo > sim_total:
             sim_total = sim_combo
+        if sim_marca >= 0.95 and sim_mod >= 0.80:
+            sim_total = max(sim_total, 0.82)
 
         if sim_total > mejor_similitud:
             mejor_similitud = sim_total
@@ -186,7 +194,11 @@ def parse_costo(val, reparar_concatenado=True):
         num = float(val)
     else:
         s = str(val).strip().upper().replace("USD", "").replace("US$", "").replace("CLP", "").replace("$", "")
-        s = s.replace(" ", "").replace("\u00a0", "")
+        s = s.replace("\u00a0", " ")
+        s = s.strip()
+        if re.fullmatch(r"\d{1,3}(?:\s\d{3}){1,}(?:[.,:]\d{2})?", s):
+            s = s.replace(" ", ".")
+        s = s.replace(" ", "")
         if re.search(r"\d:\d{2}$", s):
             s = s.replace(":", ".")
         if not s or _es_placeholder(s):
@@ -626,6 +638,131 @@ def _valor_etiquetado(texto, etiqueta):
     return None
 
 
+def _norm_ocr(texto):
+    s = unicodedata.normalize("NFD", str(texto or ""))
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    s = s.upper()
+    s = re.sub(r"[^A-Z0-9\s\-/]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def extraer_vehiculo_catalogo(texto):
+    """Localiza marca/modelo del catálogo en el texto, no en un layout fijo."""
+    t = _norm_ocr(texto)
+    if len(t) < 8:
+        return None, None
+    catalogo = get_catalogo_vehiculos()
+    marcas = sorted({m for m, _ in catalogo}, key=len, reverse=True)
+    halladas = []
+    for marca in marcas:
+        mn = _norm_ocr(marca)
+        if len(mn) < 3:
+            continue
+        if re.search(rf"\b{re.escape(mn)}\b", t):
+            halladas.append(marca)
+    if not halladas:
+        return None, None
+
+    marca = halladas[0]
+    m_lab = re.search(r"(?i)marca\s*[:/]\s*([A-Za-z0-9ÁÉÍÓÚÑáéíóúñ .\-]{2,40})", texto or "")
+    if m_lab:
+        lab = _norm_ocr(m_lab.group(1))
+        for cand in halladas:
+            if _norm_ocr(cand) in lab or lab.startswith(_norm_ocr(cand)):
+                marca = cand
+                break
+
+    modelos = [mod for m, mod in catalogo if m == marca]
+    mejor, score = None, 0.0
+    palabras = t.split()
+    for mod in modelos:
+        toks = [x for x in _tokens_vehiculo(mod) if len(x) >= 3]
+        if not toks:
+            continue
+        hits = 0.0
+        for tok in toks[:4]:
+            if re.search(rf"\b{re.escape(tok)}\b", t):
+                hits += 1.0
+            else:
+                best = max(
+                    (difflib.SequenceMatcher(None, tok, w).ratio() for w in palabras if len(w) >= 4),
+                    default=0.0,
+                )
+                if best >= 0.84:
+                    hits += best
+        sc = hits / max(len(toks[:4]), 1)
+        if sc > score:
+            score, mejor = sc, mod
+    if mejor and score >= 0.35:
+        return marca, mejor
+    return marca, None
+
+
+def _monto_parece_vehiculo(val):
+    v = parse_costo(val, reparar_concatenado=False)
+    if v >= 1_000_000:
+        return True
+    if 3_000 <= v <= 800_000:
+        return True
+    return False
+
+
+def _score_par_montos(neto, total):
+    total = parse_costo(total, reparar_concatenado=False)
+    neto = parse_costo(neto, reparar_concatenado=False)
+    if total <= 0:
+        return 0.0
+    s = 0.4 if _monto_parece_vehiculo(total) else 0.05
+    if neto <= 0:
+        return s
+    if neto > total * 1.02:
+        s -= 0.4
+    ratio = total / neto if neto else 0
+    if min(abs(ratio - r) for r in (1.0, 1.12, 1.15, 1.19, 1.21)) < 0.05:
+        s += 1.2
+    elif 0.95 <= ratio <= 1.35:
+        s += 0.4
+    return s
+
+
+def _un_digito_diff(a, b):
+    sa, sb = str(int(round(a))), str(int(round(b)))
+    if len(sa) != len(sb):
+        return False
+    return sum(x != y for x, y in zip(sa, sb)) == 1
+
+
+def _reconstruir_total_lineas(texto):
+    t = texto or ""
+    vals = []
+    for m in re.finditer(r"(?:US\$|USD|CLP|\$)\s*([\d.,: ]{3,})", t, flags=re.I):
+        ctx = t[max(0, m.start() - 70): m.start()].lower()
+        if re.search(r"\b(?:iva|subtotal|total|descuento|bono)\b", ctx):
+            continue
+        val = parse_costo(m.group(1), reparar_concatenado=False)
+        if 80 <= val <= 800_000 or val >= 1_000_000:
+            vals.append(val)
+    uniq = []
+    for v in vals:
+        if not any(abs(v - u) < 0.05 for u in uniq):
+            uniq.append(v)
+    if len(uniq) < 2:
+        return 0.0
+    veh = max(uniq)
+    extras = [u for u in uniq if u != veh and u <= veh * 0.4]
+    desc = 0.0
+    mdesc = re.search(r"(?i)descuento[^\d$]{0,24}\-?\s*\$?\s*([\d.,:]+)", t)
+    if mdesc:
+        desc = parse_costo(mdesc.group(1), reparar_concatenado=False)
+        if desc > veh * 0.4:
+            s = str(int(round(desc)))
+            if len(s) >= 2:
+                alt = parse_costo(s[1:], reparar_concatenado=False)
+                if 0 < alt <= veh * 0.3:
+                    desc = alt
+    return round(veh + sum(extras) - desc, 2)
+
+
 def _contexto_no_precio(texto, match):
     after = (texto or "")[match.end(): match.end() + 16].lower()
     before = (texto or "")[max(0, match.start() - 40): match.start()].lower()
@@ -687,11 +824,17 @@ def extraer_hechos_del_texto(texto):
 
     marca = _valor_etiquetado(t, r"marca")
     modelo = _valor_etiquetado(t, r"modelo")
-    m_combo = re.search(r"(?i)m[aá]?rca\s*/\s*modelo\s*[:\s]*\n+\s*([^\n]+)", t)
+    m_combo = re.search(
+        r"(?i)(?:marca|barca|maarca)\s*/\s*modelo\s*[:\s]*\n+\s*([^\n]+)",
+        t,
+    )
     if not m_combo:
-        m_combo = re.search(r"(?i)m[aá]?rca\s*/\s*modelo\s+([A-Za-zÁÉÍÓÚñÑ0-9][^\n]*)", t)
+        m_combo = re.search(
+            r"(?i)(?:marca|barca|maarca)\s*/\s*modelo\s+([A-Za-zÁÉÍÓÚñÑ0-9][^\n]*)",
+            t,
+        )
     if m_combo:
-        combo = re.sub(r"(?i)\(modelo referencial\)", "", m_combo.group(1)).strip(" .;,-")
+        combo = re.sub(r"(?i)\((?:modelo\s+)?referencial\)", "", m_combo.group(1)).strip(" .;,-")
         partes = combo.split()
         if len(partes) >= 2:
             marca = marca or partes[0]
@@ -708,22 +851,36 @@ def extraer_hechos_del_texto(texto):
         if modelo and not _es_placeholder(modelo) and modelo.lower() not in _MODELO_GENERICO:
             hechos["modelo"] = modelo
 
+    cat_m, cat_mod = extraer_vehiculo_catalogo(t)
+    fuzzy_h = buscar_vehiculo_fuzzy(hechos.get("marca"), hechos.get("modelo"))
+    if cat_m and (not fuzzy_h[0] or _es_placeholder(hechos.get("marca"))):
+        hechos["marca"] = cat_m
+        if cat_mod and (_es_placeholder(hechos.get("modelo")) or not fuzzy_h[1]):
+            corto = " ".join(_tokens_vehiculo(cat_mod)[:3]).title()
+            hechos["modelo"] = corto or cat_mod
+    elif fuzzy_h[0]:
+        hechos["marca"] = fuzzy_h[0]
+        if hechos.get("modelo") and fuzzy_h[1]:
+            pass
+
     beneficiario = extraer_nombre_comprador(t)
     if beneficiario and _nombre_ok(beneficiario):
         hechos["beneficiario"] = beneficiario
 
-    total = _monto_tras_etiqueta(
-        t,
-        (
-            r"valor\s+total",
-            r"total\s*a?\s*pagar",
-            r"total\s+(?:factura|proforma|referencial|cotizaci[oó]n|presupuesto)",
-            r"(?<![a-záéíóúñ])total\s*:",
-        ),
-        tomar="ultimo",
+    etiquetas_total = (
+        r"valor\s+total",
+        r"total\s*a?\s*pagar",
+        r"total\s+(?:factura|proforma|referencial|cotizaci[oó]n|presupuesto)",
+        r"(?<![a-záéíóúñ])total\s*:",
     )
-    if total > 0:
-        hechos["costo_total"] = total
+    candidatos_total = []
+    for etq in etiquetas_total:
+        val = _monto_tras_etiqueta(t, (etq,), tomar="ultimo")
+        if val > 0:
+            candidatos_total.append(val)
+        val0 = _monto_tras_etiqueta(t, (etq,), tomar="primero")
+        if val0 > 0:
+            candidatos_total.append(val0)
 
     neto = _monto_tras_etiqueta(
         t,
@@ -735,11 +892,34 @@ def extraer_hechos_del_texto(texto):
     )
     if neto <= 0:
         m_veh = re.search(
-            r"(?i)veh[ií]culo[^\n]{0,90}\$\s*([\d.,]+)",
+            r"(?i)veh[ií]culo[^\n]{0,160}(?:US\$|USD|\$)\s*([\d.,: ]+)",
             t,
         )
+        if not m_veh:
+            m_veh = re.search(
+                r"(?i)veh[ií]culo[^\n]{0,80}\n[^\n]{0,140}(?:US\$|USD|\$)\s*([\d.,: ]+)",
+                t,
+            )
         if m_veh:
             neto = parse_costo(m_veh.group(1), reparar_concatenado=False)
+
+    recon = _reconstruir_total_lineas(t)
+    if recon > 0:
+        candidatos_total.append(recon)
+
+    uniq_tot = []
+    for v in candidatos_total:
+        if v > 0 and not any(abs(v - u) < 0.05 for u in uniq_tot):
+            uniq_tot.append(v)
+
+    total = 0.0
+    if uniq_tot:
+        if neto > 0:
+            total = max(uniq_tot, key=lambda c: _score_par_montos(neto, c))
+        else:
+            plaus = [c for c in uniq_tot if _monto_parece_vehiculo(c)]
+            total = max(plaus or uniq_tot)
+
     if total > 0 and neto > 0 and total > neto * 2.2:
         s = str(int(round(total)))
         if len(s) >= 3:
@@ -752,8 +932,17 @@ def extraer_hechos_del_texto(texto):
             alt = parse_costo(s[1:], reparar_concatenado=False)
             if 0 < alt <= total:
                 neto = alt
+        elif _un_digito_diff(neto, total) or (recon and _un_digito_diff(total, recon)):
+            if recon >= neto * 0.95:
+                total = recon
+    if recon and total and _un_digito_diff(total, recon) and _score_par_montos(neto, recon) >= _score_par_montos(neto, total):
+        total = recon
     if neto > 0 and total > 0 and neto < total * 0.2:
         neto = 0.0
+    if total > 0 and not _monto_parece_vehiculo(total) and recon and _monto_parece_vehiculo(recon):
+        total = recon
+    if total > 0 and not _monto_parece_vehiculo(total):
+        total = 0.0
     if total > 0:
         hechos["costo_total"] = total
     if neto > 0:
@@ -786,16 +975,27 @@ def aplicar_hechos(datos, hechos):
 
     total_h = parse_costo(hechos.get("costo_total"), reparar_concatenado=False)
     neto_h = parse_costo(hechos.get("costo_mas_alto"), reparar_concatenado=False)
+    total_llm = parse_costo(out.get("costo_total"), reparar_concatenado=False)
     neto_llm = parse_costo(out.get("costo_mas_alto"), reparar_concatenado=False)
-    if total_h > 0:
+    if _score_par_montos(neto_h, total_h) >= _score_par_montos(neto_llm, total_llm) and total_h > 0:
         out["costo_total"] = total_h
+        if neto_h > 0:
+            out["costo_mas_alto"] = neto_h
+    else:
+        if total_llm > 0:
+            out["costo_total"] = total_llm
+        elif total_h > 0:
+            out["costo_total"] = total_h
+        if neto_llm > 0:
+            out["costo_mas_alto"] = neto_llm
+        elif neto_h > 0:
+            out["costo_mas_alto"] = neto_h
     total_final = parse_costo(out.get("costo_total"), reparar_concatenado=False)
-    if neto_h > 0 and (neto_h != total_h or neto_llm <= 0):
-        out["costo_mas_alto"] = neto_h
-    elif 0 < neto_llm <= (total_final or neto_llm):
-        out["costo_mas_alto"] = neto_llm
-    elif neto_h > 0:
-        out["costo_mas_alto"] = neto_h
+    neto_final = parse_costo(out.get("costo_mas_alto"), reparar_concatenado=False)
+    if neto_final <= 0 and total_final > 0:
+        out["costo_mas_alto"] = total_final
+    elif neto_final > total_final > 0:
+        out["costo_mas_alto"] = total_final
 
     ben_llm = out.get("beneficiario")
     ben_txt = hechos.get("beneficiario")
@@ -805,10 +1005,21 @@ def aplicar_hechos(datos, hechos):
     elif not _nombre_ok(ben_llm):
         out["beneficiario"] = None
     if hechos.get("marca") and (
-        _es_placeholder(out.get("marca")) or str(out.get("marca") or "").strip().lower() in COLORES_NO_MARCA
+        _es_placeholder(out.get("marca"))
+        or str(out.get("marca") or "").strip().lower() in COLORES_NO_MARCA
+        or (
+            buscar_vehiculo_fuzzy(hechos.get("marca"), hechos.get("modelo") or out.get("modelo"))[0]
+            and not buscar_vehiculo_fuzzy(out.get("marca"), out.get("modelo"))[0]
+        )
     ):
         out["marca"] = hechos["marca"]
-    if hechos.get("modelo") and _es_placeholder(out.get("modelo")):
+    if hechos.get("modelo") and (
+        _es_placeholder(out.get("modelo"))
+        or (
+            buscar_vehiculo_fuzzy(out.get("marca") or hechos.get("marca"), hechos.get("modelo"))[1]
+            and not buscar_vehiculo_fuzzy(out.get("marca"), out.get("modelo"))[1]
+        )
+    ):
         out["modelo"] = hechos["modelo"]
     return normalizar_datos_llm(out)
 
@@ -979,8 +1190,9 @@ REGLAS:
 5. costo_total = total a pagar / valor total / total factura, no un subtotal ni IVA.
 6. costo_mas_alto = precio neto o unitario del vehículo, no un accesorio. Puede ser menor que el total.
 7. Números con punto decimal y SIN miles. Chile: 37.344.066 → 37344066. Ecuador: 48,500.00 → 48500.00
-8. Marca comercial, nunca un color. No inventes ni copies "valor" ni "No especificado".
+8. Marca comercial del VEHÍCULO (bloque marca/modelo o detalle), nunca un color ni el nombre de la concesionaria.
 9. Si un campo no está (plantilla vacía), null (costos 0.0).
+10. Importes: transcribe TODOS los dígitos. Chile 86.939.122 → 86939122. No recortes ni inventes.
 """.strip()
 
 
@@ -1042,6 +1254,15 @@ def extraer_texto_doctr(imagen_pil):
 TESS_CFG = "--oem 1 --psm 6"
 
 
+def _calidad_montos(texto):
+    return len(re.findall(
+        r"(?:\$|USD|US\$)\s*\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{2})?"
+        r"|(?:\$|USD|US\$)\s*\d+[.,]\d{2}",
+        texto or "",
+        flags=re.I,
+    ))
+
+
 def _calidad_ocr(texto):
     t = texto or ""
     letras = len(re.findall(r"[A-Za-záéíóúÁÉÍÓÚñÑ]", t))
@@ -1097,33 +1318,33 @@ def extraer_texto_ocr(imagen_pil):
         img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
     img = _rotar_osd(img)
 
-    t0 = pytesseract.image_to_string(img, lang="spa", config=TESS_CFG)
+    t0 = pytesseract.image_to_string(img, lang="spa", config="--oem 1 --psm 6")
+    t4 = pytesseract.image_to_string(img, lang="spa", config="--oem 1 --psm 4")
     texto = t0 or ""
-    if _parece_texto_invertido(t0) or _calidad_ocr(t0) < 140:
+    if _calidad_montos(t4) > _calidad_montos(texto) or _calidad_ocr(t4) > _calidad_ocr(texto):
+        texto = (texto + "\n" + (t4 or "")).strip() if texto else (t4 or "")
+    elif t4 and t4.strip() != (t0 or "").strip():
+        texto = (texto + "\n" + t4).strip()
+
+    if _parece_texto_invertido(texto) or _calidad_ocr(texto) < 140:
         t180 = pytesseract.image_to_string(
             img.rotate(180, expand=True, fillcolor="white"),
             lang="spa",
-            config=TESS_CFG,
+            config="--oem 1 --psm 6",
         )
-        q0, q180 = _calidad_ocr(t0), _calidad_ocr(t180)
+        q0, q180 = _calidad_ocr(texto), _calidad_ocr(t180)
         if q180 > q0 * 1.1 and q180 > 80:
             texto = t180
-        elif _ocr_tiene_cliente(t180) and not _ocr_tiene_cliente(t0):
-            texto = (t0 or "") + "\n" + (t180 or "")
-        elif _parece_texto_invertido(t0) and q180 > 40:
-            texto = (t0 or "") + "\n" + (t180 or "")
+        elif _ocr_tiene_cliente(t180) and not _ocr_tiene_cliente(texto):
+            texto = (texto or "") + "\n" + (t180 or "")
+        elif _parece_texto_invertido(texto) and q180 > 40:
+            texto = (texto or "") + "\n" + (t180 or "")
 
-    n_montos = len(re.findall(r"\$\s*[\d.,:]{3,}", texto))
-    anclas = bool(re.search(r"(?i)factura|proforma|rut|ruc|total|marca|vendedor|comprador", texto or ""))
-    tess_util = anclas and _calidad_ocr(texto) >= 120
-    if not tess_util or n_montos < 1:
+    if _calidad_montos(texto) < 2 or _calidad_ocr(texto) < 120:
         try:
             td = extraer_texto_doctr(img)
             if td:
-                if tess_util:
-                    texto = (texto or "") + "\n" + td
-                elif _calidad_ocr(td) > _calidad_ocr(texto):
-                    texto = td
+                texto = ((texto or "") + "\n" + td).strip()
         except Exception as e:
             print(f"[⚠️ DocTR: {e}]")
     return (texto or "").strip()
@@ -1166,6 +1387,12 @@ def estructurar_con_llm(texto, modelo="qwen2.5:3b", intento_nombre=None, motivo_
         extra += f"\nTotal a pagar en el texto: {hechos['costo_total']}.\n"
     if hechos and parse_costo(hechos.get("costo_mas_alto"), reparar_concatenado=False) > 0:
         extra += f"Precio neto/unitario del vehículo en el texto: {hechos['costo_mas_alto']}.\n"
+    if hechos and hechos.get("marca"):
+        extra += (
+            f"\nMarca del vehículo en el texto: {hechos['marca']}"
+            + (f" modelo {hechos['modelo']}" if hechos.get("modelo") else "")
+            + ". No uses la razón social del emisor como marca.\n"
+        )
     extra += (
         "\nEl formato del documento es desconocido. Identifica emisor vs comprador por el rol "
         "(quién vende / a quién se factura), no por el orden de aparición.\n"
@@ -1227,8 +1454,8 @@ def extraer_con_minicpm(imagenes_pil, max_reintentos=2):
     return {"error": "MiniCPM-V falló en todos los reintentos."}
 
 
-def requiere_reextraccion(motivo_fallo):
-    """MiniCPM/otro LLM no van a meter un vehículo inventado en la BD."""
+def requiere_reextraccion(motivo_fallo, es_nativo=True):
+    """En nativos, un fallo de catálogo no se arregla con otro LLM. En escaneos sí: el OCR pudo leer mal el vehículo."""
     partes = [p.strip().lower() for p in (motivo_fallo or "").split("|") if p.strip()]
     if not partes:
         return True
@@ -1243,7 +1470,10 @@ def requiere_reextraccion(motivo_fallo):
         "error de ia",
         "demasiado corto",
         "mal formado",
+        "parece un color",
     )
+    if not es_nativo:
+        recuperables = recuperables + ("vehículo no existe", "vehiculo no existe", "similitud baja")
     return any(any(clave in parte for clave in recuperables) for parte in partes)
 
 
@@ -1604,7 +1834,7 @@ def rasterizar_paginas(ruta_archivo, indices, dpi=250):
 
 
 def extraer_y_validar(texto, imagenes_doc, es_nativo):
-    """Un LLM de texto + anclas regex. MiniCPM solo si es escaneado y faltan campos."""
+    """Un LLM de texto + anclas regex. MiniCPM en escaneos si faltan campos, montos incoherentes o el vehículo no calza."""
     hechos = extraer_hechos_del_texto(texto)
     print(f"[INFO] Hechos anclados del texto: {json.dumps(hechos, ensure_ascii=False, default=str)}")
 
@@ -1613,13 +1843,13 @@ def extraer_y_validar(texto, imagenes_doc, es_nativo):
     )
     datos = aplicar_hechos(datos, hechos)
     es_valido, msj = evaluar_extraccion(datos)
-
-    if es_valido or not requiere_reextraccion(msj):
-        if not es_valido:
-            print(f"\n[FALLO: {msj}] Sin reintento de modelo: el texto ya cubre los campos; queda catálogo/validación.")
-        return datos, es_valido, msj
+    score_montos = _score_par_montos(datos.get("costo_mas_alto"), datos.get("costo_total"))
 
     if es_nativo:
+        if es_valido or not requiere_reextraccion(msj, es_nativo=True):
+            if not es_valido:
+                print(f"\n[FALLO: {msj}] Sin reintento de modelo: el texto ya cubre los campos; queda catálogo/validación.")
+            return datos, es_valido, msj
         print(f"\n[FALLO INTENTO 1: {msj}]. Reintento de texto con Qwen (sin MiniCPM-V).")
         datos_2 = estructurar_con_llm(
             texto,
@@ -1632,9 +1862,24 @@ def extraer_y_validar(texto, imagenes_doc, es_nativo):
         es_valido, msj = evaluar_extraccion(datos)
         return datos, es_valido, msj
 
-    print(f"\n[FALLO INTENTO 1: {msj}]. Escaneado: MiniCPM-V una sola pasada visual.")
+    necesita_vision = (
+        not es_valido
+        and requiere_reextraccion(msj, es_nativo=False)
+    ) or score_montos < 0.8 or not _monto_parece_vehiculo(datos.get("costo_total"))
+    if es_valido and not necesita_vision:
+        return datos, es_valido, msj
+
+    print(f"\n[FALLO INTENTO 1: {msj}]. Escaneado: MiniCPM-V una pasada visual.")
     datos_2 = extraer_con_minicpm(imagenes_doc, max_reintentos=2)
-    datos = aplicar_hechos(fusionar_sin_pisar(datos, datos_2), hechos)
+    datos = fusionar_sin_pisar(datos, datos_2)
+    datos = aplicar_hechos(datos, hechos)
+    if _score_par_montos(datos_2.get("costo_mas_alto"), datos_2.get("costo_total")) > _score_par_montos(
+        datos.get("costo_mas_alto"), datos.get("costo_total")
+    ):
+        if parse_costo(datos_2.get("costo_total"), reparar_concatenado=False) > 0:
+            datos["costo_total"] = parse_costo(datos_2.get("costo_total"), reparar_concatenado=False)
+        if parse_costo(datos_2.get("costo_mas_alto"), reparar_concatenado=False) > 0:
+            datos["costo_mas_alto"] = parse_costo(datos_2.get("costo_mas_alto"), reparar_concatenado=False)
     es_valido, msj = evaluar_extraccion(datos)
     return datos, es_valido, msj
 

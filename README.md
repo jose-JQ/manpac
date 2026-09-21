@@ -15,14 +15,15 @@ A partir de un documento, el sistema intenta obtener:
 | `marca` / `modelo` | Vehículo comercial detectado en el documento |
 | `marca_base` / `modelo_base` | Mejor coincidencia en `vehiculos.db` |
 | `cantidad` | Unidades |
-| `beneficiario` | Nombre del cliente |
-| `ci` | Cédula o RUC (solo dígitos) |
-| `costo_mas_alto` | Ítem vehicular más caro |
+| `beneficiario` | Nombre o razón social del comprador (persona o empresa) |
+| `ci` | Cédula, RUT o RUC del **comprador** (nunca del vendedor) |
+| `costo_mas_alto` | Ítem vehicular más caro (neto o referencial) |
 | `costo_total` | Total a pagar |
 | `estado` | `ÉXITO` o `REVISIÓN (...motivo...)` |
 | `paginas_pdf` | Páginas del PDF que formaron esa factura |
+| `archivo_guardado` | Nombre del fragmento PDF copiado a la carpeta de salida |
 
-Un PDF de varias páginas puede contener **varias facturas**. El pipeline las segmenta y las va devolviendo en tiempo real.
+Un PDF de varias páginas puede contener **varias facturas**. El pipeline las segmenta, guarda cada fragmento lógico y las va devolviendo en tiempo real.
 
 ---
 
@@ -35,10 +36,10 @@ flowchart LR
     usuario[Usuario] --> ui[Streamlit<br/>app.py :8501]
     ui -->|POST multipart + stream NDJSON| api[FastAPI<br/>api_backend.py :8000]
     api --> pipe[pipeline.py]
-    pipe --> ocr[OCR: PyMuPDF / Tesseract / DocTR]
-    ocr --> llm[Ollama: Qwen 2.5, MiniCPM-V, Llama 3.1]
+    pipe --> ocr[PyMuPDF o Tesseract + DocTR]
+    ocr --> llm[Qwen 2.5 y MiniCPM-V]
     llm --> val[Validación fuzzy vs SQLite]
-    val --> out[Excel, log y carpetas de salida]
+    val --> out[Excel, log y fragmentos]
     val --> ui
 ```
 
@@ -57,26 +58,85 @@ La UI **no** carga los modelos de IA. Solo habla con la API. Por eso hay que ten
 
 ## Cómo funciona el pipeline
 
-1. **Lectura del archivo**
-   - PDF nativo: extrae texto con PyMuPDF.
-   - PDF escaneado o imagen: rasteriza con Poppler (`pdf2image`) y pasa por Tesseract. Si el texto sigue siendo pobre, usa **DocTR** (detección `db_resnet50` + reconocimiento `crnn_vgg16_bn`).
-2. **Segmentación**
-   - Busca encabezados tipo `FACTURA/PROFORMA` + número `000-000-000000000` para partir un PDF en documentos lógicos.
-3. **Intento 1 — texto**
-   - **Qwen 2.5 3B** (`qwen2.5:3b`) convierte el texto en JSON.
-4. **Validación**
-   - Costos (formatos `38.500,00` / `38,500.00`; corrige dígitos concatenados).
-   - CI/RUC numérico.
-   - Beneficiario real (no plantillas tipo “Nombre del cliente”).
-   - Marca no puede ser un color.
-   - Coincidencia **fuzzy** contra el catálogo, ignorando sufijos técnicos (`AC 5P 4X2 TA EV`).
-5. **Intento 2 — si falla**
-   - **MiniCPM-V** lee hasta 2 páginas como imagen.
-   - **Llama 3.1** actúa de juez y fusiona ambos JSON.
-6. **Salida**
-   - Cada factura se `yield` a la API (la UI la pinta al momento).
-   - Éxitos → `procesados_exito/` + `reporte_extracciones.xlsx`.
-   - Fallos → `revision_manual/` + `log_revision_fallos.txt`.
+El flujo es el mismo para facturas, proformas, cotizaciones y notas de venta. El sistema no asume un diseño de plantilla: busca **roles** (emisor vs comprador) y **hechos** anclados en el texto.
+
+```mermaid
+flowchart TB
+    archivo[PDF o imagen] --> nativo{¿Página nativa?}
+    nativo -->|Sí: texto útil, poca foto| pymupdf[PyMuPDF]
+    nativo -->|No: escaneo o imagen| raster[Raster 250 dpi]
+    raster --> tess[Tesseract spa psm 4+6]
+    tess --> doctr{¿Montos o texto pobres?}
+    doctr -->|Sí| doctrOcr[DocTR]
+    doctr -->|No| seg
+    doctrOcr --> seg
+    pymupdf --> seg[Segmentar documentos lógicos]
+    seg --> hechos[Anclas regex: CI, nombre, montos, vehículo]
+    hechos --> qwen[Qwen 2.5 3B → JSON]
+    qwen --> aplicar[Fusionar anclas + LLM]
+    aplicar --> eval{¿Válido?}
+    eval -->|Nativo y falta campo| qwen2[Reintento Qwen]
+    qwen2 --> eval2{¿Válido?}
+    eval -->|Escaneo dudoso| mini[MiniCPM-V sobre la imagen]
+    mini --> eval2
+    eval -->|OK| exito
+    eval2 -->|OK| exito[ÉXITO: fragmento + Excel]
+    eval2 -->|No| rev[REVISIÓN: fragmento + log]
+    eval -->|Catálogo nativo| rev
+```
+
+### 1. Lectura del archivo
+
+Cada página se clasifica con `es_pagina_nativa`:
+
+- **Nativo:** hay texto útil y la hoja no está cubierta por una foto grande. Se usa solo **PyMuPDF**. No se rasteriza ni se llama a MiniCPM-V.
+- **No nativo** (escaneo, foto, PDF imagen): raster 250 dpi con Poppler → **Tesseract** (`spa`, OSD para rotación, `psm 6` + `psm 4`, corrección de texto invertido 180°). Si hay menos de dos montos bien formados, entra **DocTR** (`db_resnet50` + `crnn_vgg16_bn`).
+
+Las imágenes sueltas (PNG/JPG) siempre van por la rama de escaneo.
+
+### 2. Segmentación
+
+`segmentar_documentos_logicos` parte un PDF en **documentos lógicos** (una factura o proforma, no una página suelta). Señales:
+
+- Tipo: factura, proforma, cotización, presupuesto, nota de venta.
+- Folio alfanumérico (no solo `PE`/`PRO`/`FAC`).
+- Portada con bloque `VENDEDOR` / `COMPRADOR`.
+- Continuación: formularios de anexo, líneas de “conforme”, páginas cortas sin encabezado propio.
+
+Cada documento lógico se guarda como fragmento PDF en `procesados_exito/` o `revision_manual/`.
+
+### 3. Extracción (anclas + Qwen)
+
+1. **Hechos regex** (`extraer_hechos_del_texto`): comprador vs vendedor, CI/RUT/RUC, razón social o nombre, marca/modelo (también contra el catálogo), montos coherentes con IVA 0/12/15/19 % y reconstrucción de ítems si el OCR cambia un dígito.
+2. **Qwen 2.5 3B** (`qwen2.5:3b`) convierte el texto en JSON, con esos hechos como pista.
+3. `aplicar_hechos` veta el RUC/RUT del **vendedor** como CI del comprador, elige el mejor par de montos y confirma marca/modelo si el catálogo ya los vio en el texto.
+
+El comprador puede ser **persona** (cédula 8–10 dígitos) o **empresa** (RUT chileno o RUC ecuatoriano de 13). Se descartan RUC dummy tipo `0999999999001`.
+
+### 4. Reintento según tipo de página
+
+| Caso | Qué hace |
+| --- | --- |
+| Nativo y faltan CI, nombre o costos | Segundo pase de **Qwen** (sin visión) |
+| Nativo y el vehículo no está en el catálogo | Queda en **REVISIÓN**. MiniCPM-V no entra: el texto ya se leyó bien |
+| Escaneo y faltan campos, montos incoherentes, total poco creíble o el vehículo no calza | **MiniCPM-V** lee hasta 2 páginas como imagen y se fusiona sin pisar un costo bueno |
+
+No hay un tercer modelo “juez”. Llama 3.1 **no** forma parte del flujo.
+
+### 5. Validación
+
+- Costos: formatos `38.500,00` / `38,500.00` / `29.076.817` (CLP). No se “arreglan” concatenados tipo `/10`. Se puntúa el par neto/total contra IVA. Se rechazan totales que parecen km, años o cifras &lt; ~3000 USD salvo millones CLP.
+- CI/RUT/RUC del comprador, no del emisor.
+- Beneficiario real (no plantillas ni giro/dirección).
+- Marca no puede ser un color.
+- Coincidencia **fuzzy** contra `vehiculos.db`, ignorando sufijos técnicos (`AC 5P 4X2 TA EV`) y partiendo tokens con guion (`e-Auman` → `AUMAN`).
+
+### 6. Salida
+
+Cada factura se `yield` a la API (la UI la pinta al momento).
+
+- Éxitos → `procesados_exito/` + `reporte_extracciones.xlsx`.
+- Fallos → `revision_manual/` + `log_revision_fallos.txt`.
 
 ---
 
@@ -93,11 +153,11 @@ Ver `requirements.txt`. Las librerías y para qué sirven:
 | `requests` | Cliente HTTP de la UI hacia la API |
 | `SQLAlchemy` | ORM y consultas a `vehiculos.db` |
 | `pandas` + `openpyxl` | Excel de extracciones |
-| `pymupdf` | Texto nativo de PDF |
+| `pymupdf` | Texto nativo de PDF y recorte de fragmentos |
 | `pdf2image` | PDF → imágenes (requiere Poppler) |
-| `pytesseract` | OCR clásico (requiere Tesseract) |
+| `pytesseract` | OCR clásico (requiere Tesseract `spa`) |
 | `python-doctr` + `torch` | OCR neuronal para escaneos difíciles |
-| `opencv-python` + `numpy` + `pillow` | Preprocesado de imagen |
+| `opencv-python` + `numpy` + `pillow` | Imágenes (DocTR / PIL) |
 | `ollama` | Cliente de los modelos locales |
 
 Instalación rápida:
@@ -128,8 +188,10 @@ Modelos de Ollama que el pipeline espera:
 ```bat
 ollama pull qwen2.5:3b
 ollama pull minicpm-v
-ollama pull llama3.1
 ```
+
+- `qwen2.5:3b` — siempre (texto nativo y OCR).
+- `minicpm-v` — solo escaneos cuando el primer pase no cierra.
 
 Rutas por defecto (se pueden cambiar con variables de entorno):
 
@@ -199,6 +261,7 @@ Carpetas que se crean solas al procesar: `temp_api_uploads/`, `procesados_exito/
 ## Limitaciones
 
 - Corre en local; no es un despliegue en la nube.
-- MiniCPM-V y Llama 3.1 piden RAM/VRAM. En CPU será lento.
+- MiniCPM-V pide RAM/VRAM. En CPU, los escaneos dudosos serán lentos.
 - Vehículos que no existan en `vehiculos.db` (o con OCR muy pobre) salen como `REVISIÓN`.
 - Las rutas de Poppler/Tesseract están pensadas para Windows.
+- Los PDF de `docs/` son muestras de prueba, no plantillas: el extractor generaliza por roles y anclas, no por un diseño fijo.

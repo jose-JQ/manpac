@@ -61,6 +61,34 @@ _MODELO_GENERICO = {
     "auto", "camion", "camión", "suv", "sedan", "sedán",
 }
 
+_RE_ACCESORIO_CTX = re.compile(
+    r"(?i)\b(?:cargador|wallbox|wall\s*box|charger|accesorio|repuesto|"
+    r"flete|env[ií]o|instalaci[oó]n|matricul(?:aci[oó]n)?|soat|"
+    r"seguro(?:s)?(?:\s+obligatorio)?|placas?(?:\s+el[eé]ctric|\s+patente)?|"
+    r"kit\s+(?:de\s+)?(?:emergencia|matricul|carga)|mantenimiento|"
+    r"gesti[oó]n\s+de\s+matricul)\b"
+)
+_RE_FICHA_SPEC = re.compile(
+    r"(?i)\b(?:bater[ií]a|autonom[ií]a|potencia|tracci[oó]n|motor\s+el[eé]ctrico)\s*:"
+)
+_RE_TOTAL_CTX = re.compile(
+    r"(?i)(?:valor\s+total|valor\s+a\s+pagar|total\s*a?\s*pagar|monto\s+(?:total|a\s+pagar)|"
+    r"total\s+general|total\s+documento|importe\s+total|grand\s+total|"
+    r"subtotal|\biva\b|descuento|total\s+(?:factura|proforma|referencial|cotizaci[oó]n|presupuesto))"
+)
+_RE_PIE_MONTO = re.compile(
+    r"(?i)\b(?:iva|subtotal|descuento|bono|recargo|propina)\b"
+)
+_RE_TITULO_RUIDO = re.compile(
+    r"(?i)^(c[oó]digo|descripci[oó]n|cant(?:idad)?\.?|p\.?\s*unit(?:ario)?|"
+    r"total|subtotal|[ií]tem|valor|concepto|[a-z]{1,8}[-/]\d{1,6}[a-z0-9]*)s?$"
+)
+_RE_MONTO = re.compile(
+    r"(?:(?P<cur>US\$|USD|CLP|\$)\s*)?"
+    r"(?P<num>\d{1,3}(?:[.,]\d{3}){1,3}(?:[.,]\d{2})?|\d+[.,]\d{2})",
+    re.I,
+)
+
 SUFIJOS_TECNICOS = {
     "AC", "TA", "TM", "EV", "BEV", "PHEV", "HEV", "CN", "CD", "CS",
     "FWD", "AWD", "RWD", "QUATT", "QUATTRO", "4X2", "4X4", "6X4",
@@ -139,6 +167,8 @@ def buscar_vehiculo_fuzzy(marca_buscada, modelo_buscado, umbral_total=0.90):
     tokens_marca = _tokens_vehiculo(marca_txt)
     tokens_modelo = _tokens_vehiculo(modelo_txt)
     tokens_combo = _tokens_vehiculo(f"{marca_txt} {modelo_txt}".strip())
+    if not tokens_modelo:
+        return None, None
 
     resultados = get_catalogo_vehiculos()
 
@@ -646,9 +676,10 @@ def _norm_ocr(texto):
     return re.sub(r"\s+", " ", s).strip()
 
 
-def extraer_vehiculo_catalogo(texto):
-    """Localiza marca/modelo del catálogo en el texto, no en un layout fijo."""
-    t = _norm_ocr(texto)
+def extraer_vehiculo_catalogo(texto, exigir_modelo=False):
+    """Localiza marca/modelo del catálogo. exigir_modelo evita marcas sueltas en accesorios."""
+    t_orig = texto or ""
+    t = _norm_ocr(t_orig)
     if len(t) < 8:
         return None, None
     catalogo = get_catalogo_vehiculos()
@@ -658,7 +689,37 @@ def extraer_vehiculo_catalogo(texto):
         mn = _norm_ocr(marca)
         if len(mn) < 3:
             continue
-        if re.search(rf"\b{re.escape(mn)}\b", t):
+        hit = False
+        for m in re.finditer(rf"(?i)\b{re.escape(marca)}\b", t_orig):
+            win = t_orig[max(0, m.start() - 80): m.end() + 80]
+            if _RE_ACCESORIO_CTX.search(win):
+                continue
+            hit = True
+            break
+        if not hit and re.search(rf"\b{re.escape(mn)}\b", t):
+            for m in re.finditer(rf"\b{re.escape(mn)}\b", t):
+                win = t[max(0, m.start() - 80): m.end() + 80]
+                if _RE_ACCESORIO_CTX.search(win):
+                    continue
+                hit = True
+                break
+        if hit and exigir_modelo:
+            modelos_marca = [mod for m, mod in catalogo if m == marca]
+            toks_mod = []
+            for mod in modelos_marca:
+                toks_mod.extend(x for x in _tokens_vehiculo(mod) if len(x) >= 3)
+            if toks_mod:
+                cerca = False
+                for m in re.finditer(rf"(?i)\b{re.escape(marca)}\b", t_orig):
+                    win = _norm_ocr(t_orig[max(0, m.start() - 70): m.end() + 90])
+                    if _RE_ACCESORIO_CTX.search(t_orig[max(0, m.start() - 70): m.end() + 90]):
+                        continue
+                    if any(re.search(rf"\b{re.escape(tok)}\b", win) for tok in toks_mod[:8]):
+                        cerca = True
+                        break
+                if not cerca:
+                    hit = False
+        if hit:
             halladas.append(marca)
     if not halladas:
         return None, None
@@ -715,12 +776,12 @@ def _score_par_montos(neto, total):
     s = 0.4 if _monto_parece_vehiculo(total) else 0.05
     if neto <= 0:
         return s
-    if neto > total * 1.02:
+    if neto > total * 1.25:
         s -= 0.4
     ratio = total / neto if neto else 0
     if min(abs(ratio - r) for r in (1.0, 1.12, 1.15, 1.19, 1.21)) < 0.05:
         s += 1.2
-    elif 0.95 <= ratio <= 1.35:
+    elif 0.80 <= ratio <= 1.35:
         s += 0.4
     return s
 
@@ -734,33 +795,22 @@ def _un_digito_diff(a, b):
 
 def _reconstruir_total_lineas(texto):
     t = texto or ""
-    vals = []
-    for m in re.finditer(r"(?:US\$|USD|CLP|\$)\s*([\d.,: ]{3,})", t, flags=re.I):
-        ctx = t[max(0, m.start() - 70): m.start()].lower()
-        if re.search(r"\b(?:iva|subtotal|total|descuento|bono)\b", ctx):
-            continue
-        val = parse_costo(m.group(1), reparar_concatenado=False)
-        if 80 <= val <= 800_000 or val >= 1_000_000:
-            vals.append(val)
-    uniq = []
-    for v in vals:
-        if not any(abs(v - u) < 0.05 for u in uniq):
-            uniq.append(v)
-    if len(uniq) < 2:
+    veh = extraer_maximo_linea_vehiculo(t)
+    if veh <= 0:
         return 0.0
-    veh = max(uniq)
-    extras = [u for u in uniq if u != veh and u <= veh * 0.4]
+    extras = []
     desc = 0.0
-    mdesc = re.search(r"(?i)descuento[^\d$]{0,24}\-?\s*\$?\s*([\d.,:]+)", t)
-    if mdesc:
-        desc = parse_costo(mdesc.group(1), reparar_concatenado=False)
-        if desc > veh * 0.4:
-            s = str(int(round(desc)))
-            if len(s) >= 2:
-                alt = parse_costo(s[1:], reparar_concatenado=False)
-                if 0 < alt <= veh * 0.3:
-                    desc = alt
-    return round(veh + sum(extras) - desc, 2)
+    for m, val, _cur in _iter_montos(t):
+        rol = _rol_importe(t, m, val)
+        if rol == "accesorio" and val <= veh * 0.4:
+            extras.append(val)
+        elif rol == "pie" and re.search(r"(?i)descuento", t[max(0, m.start() - 80): m.start()]):
+            desc = max(desc, val)
+    uniq_ex = []
+    for v in extras:
+        if not any(abs(v - u) < 0.05 for u in uniq_ex):
+            uniq_ex.append(v)
+    return round(veh + sum(uniq_ex) - desc, 2)
 
 
 def _contexto_no_precio(texto, match):
@@ -771,6 +821,53 @@ def _contexto_no_precio(texto, match):
     if re.search(r"(autonom|potencia|bater|tel[eé]fono|p[aá]gina|a[nñ]o modelo)", before):
         return True
     return False
+
+
+def _es_contexto_pie(ctx):
+    c = ctx or ""
+    return bool(_RE_TOTAL_CTX.search(c) or _RE_PIE_MONTO.search(c[-100:]))
+
+
+def _iter_montos(texto):
+    """Importes con o sin símbolo, descartando RUT, años y cifras técnicas."""
+    t = texto or ""
+    for m in _RE_MONTO.finditer(t):
+        if re.match(r"\s*-[\dkK]\b", t[m.end(): m.end() + 4], flags=re.I):
+            continue
+        if re.search(r"(?i)(?:rut|ruc|c[eé]dula|c\.?i\.?)\s*:?\s*$", t[max(0, m.start() - 24): m.start()]):
+            continue
+        if _contexto_no_precio(t, m):
+            continue
+        bruto = m.group("num")
+        cur = m.group("cur")
+        val = parse_costo(bruto, reparar_concatenado=False)
+        if val <= 0:
+            continue
+        if not cur:
+            tiene_miles = bool(re.search(r"\d[.,]\d{3}", bruto))
+            tiene_dec = bool(re.search(r"[.,]\d{2}$", bruto))
+            if not tiene_miles and not (tiene_dec and val >= 1000):
+                continue
+        yield m, val, bool(cur)
+
+
+def _rol_importe(texto, match, val):
+    before = (texto or "")[max(0, match.start() - 110): match.start()]
+    if _es_contexto_pie(before):
+        if re.search(
+            r"(?i)(?:valor\s+total|valor\s+a\s+pagar|total\s*a?\s*pagar|monto\s+(?:total|a\s+pagar)|"
+            r"total\s+general|total\s+documento|importe\s+total|grand\s+total|"
+            r"total\s+(?:factura|proforma|referencial|cotizaci[oó]n|presupuesto))",
+            before[-110:],
+        ):
+            return "total"
+        return "pie"
+    tit = _titulo_desde_contexto((texto or "")[max(0, match.start() - 280): match.start()])
+    if tit and _RE_ACCESORIO_CTX.search(tit):
+        return "accesorio"
+    if _monto_parece_vehiculo(val):
+        return "detalle"
+    return "otro"
 
 
 def _parsear_monto_en_match(texto, match, bruto, tiene_dollar):
@@ -791,10 +888,9 @@ def _monto_tras_etiqueta(texto, etiquetas, tomar="primero"):
     hallados = []
     for etq in etiquetas:
         for mlab in re.finditer(rf"(?i){etq}", t):
-            ventana = t[mlab.end(): mlab.end() + 220]
+            ventana = t[mlab.end(): mlab.end() + 260]
             locales = []
-            for m in re.finditer(r"(?:US\$|USD|CLP|\$)\s*([\d.,:]+)", ventana, flags=re.I):
-                val = _parsear_monto_en_match(ventana, m, m.group(1), True)
+            for m, val, _cur in _iter_montos(ventana):
                 if val:
                     locales.append(val)
             if not locales:
@@ -809,6 +905,174 @@ def _monto_tras_etiqueta(texto, etiquetas, tomar="primero"):
     if not hallados:
         return 0.0
     return hallados[-1] if tomar == "ultimo" else hallados[0]
+
+
+def _limpiar_titulo_producto(raw):
+    t = str(raw or "").strip()
+    t = re.sub(r"^[^\wÁÉÍÓÚÑáéíóúñ]+", "", t)
+    t = re.sub(r"(?i)\((?:edici[oó]n|modelo)?\s*\d{4}\)", "", t)
+    t = re.sub(r"(?i)\((?:edici[oó]n|modelo\s+)?referencial[^)]*\)", "", t)
+    t = re.split(r"(?i)\s*\|\s*|\bcolor\b|\binterior\b|\bincluye\b", t)[0]
+    t = re.sub(r"\s+", " ", t).strip(" .;,-")
+    t = re.sub(r"(?i)\s+\(?edici[oó]n\s+\d{4}\)?$", "", t)
+    return t.strip(" .;,-")
+
+
+def _partir_nombre_comercial(titulo):
+    """Sin etiqueta Marca/Modelo: primer token = marca, el resto = modelo."""
+    t = _limpiar_titulo_producto(titulo)
+    if not t or _RE_TITULO_RUIDO.match(t) or _RE_ACCESORIO_CTX.search(t):
+        return None, None
+    catalogo = get_catalogo_vehiculos()
+    marcas = sorted({m for m, _ in catalogo}, key=len, reverse=True)
+    for marca in marcas:
+        m = re.match(rf"(?i)^{re.escape(marca)}\b\s*(.*)$", t)
+        if m:
+            resto = (m.group(1) or "").strip(" .;,-") or None
+            if resto and resto.lower() in _MODELO_GENERICO:
+                resto = None
+            return marca, resto
+    partes = t.split()
+    while partes and partes[0].lower().rstrip(":") in _MODELO_GENERICO:
+        partes = partes[1:]
+    if not partes or _es_placeholder(partes[0]):
+        return None, None
+    if len(partes) == 1:
+        return partes[0], None
+    modelo = " ".join(partes[1:]).strip(" .;,-")
+    modelo = re.sub(r"(?i)\s*\([^)]*edici[oó]n[^)]*\)", "", modelo).strip(" .;,-")
+    modelo = re.sub(r"(?i)\s+(19|20)\d{2}$", "", modelo).strip(" .;,-")
+    if not modelo or modelo.lower() in _MODELO_GENERICO:
+        modelo = None
+    return partes[0], modelo
+
+
+def _titulo_desde_contexto(ctx):
+    candidatos = []
+    for ln in (ctx or "").splitlines():
+        ln = _limpiar_titulo_producto(ln)
+        if not ln or len(ln) < 3:
+            continue
+        if _RE_TITULO_RUIDO.match(ln) or _RE_FICHA_SPEC.search(ln):
+            continue
+        if re.fullmatch(r"[\d.,\s$USDCLP\-]+", ln, flags=re.I):
+            continue
+        if ln.lower().startswith(("color", "incluye", "interior")):
+            continue
+        if _RE_ACCESORIO_CTX.search(ln):
+            continue
+        candidatos.append(ln)
+    candidatos = [c for c in candidatos if _score_titulo_producto(c) > 0]
+    if not candidatos:
+        return None
+    return max(candidatos, key=_score_titulo_producto)
+
+
+def _titulo_vehiculo_ok(tit):
+    t = _limpiar_titulo_producto(tit)
+    if not t or len(t) < 4:
+        return False
+    if re.match(
+        r"(?i)^(dm-?i|ev|suv|awd|4x[24]|a[nñ]o|year|edici[oó]n|color|"
+        r"cantidad|marca|modelo|cortes[ií]a|ecocuero)\b",
+        t,
+    ):
+        return False
+    if t.count(")") > t.count("("):
+        return False
+    toks = [x for x in re.split(r"\W+", t) if len(x) >= 2]
+    return len(toks) >= 2
+
+
+def _score_titulo_producto(tit):
+    t = _limpiar_titulo_producto(tit)
+    if not _titulo_vehiculo_ok(t):
+        return -1.0
+    sc = float(len([x for x in t.split() if len(x) >= 2]))
+    tn = _norm_ocr(t)
+    for marca, _ in get_catalogo_vehiculos():
+        mn = _norm_ocr(marca)
+        if len(mn) >= 3 and re.search(rf"\b{re.escape(mn)}\b", tn):
+            sc += 5.0
+            break
+    if re.search(r"(?i)\b(?:veh[ií]culo|auto|cami[oó]n)\b", t):
+        sc += 2.0
+    if re.match(r"(?i)^(suv|sedan|hatch|color|interior)", t):
+        sc -= 4.0
+    return sc
+
+
+def extraer_producto_principal(texto):
+    """Ítem vehicular cuando no hay 'Marca:'/'Modelo:': ficha técnica o línea más cara."""
+    t = texto or ""
+    titulo_ficha = None
+    lines = [ln.strip() for ln in t.splitlines()]
+    for i, ln in enumerate(lines):
+        if not _RE_FICHA_SPEC.search(ln):
+            continue
+        for prev in reversed(lines[:i]):
+            prev_c = _limpiar_titulo_producto(prev)
+            if not prev_c or _RE_FICHA_SPEC.search(prev_c):
+                continue
+            if _RE_TITULO_RUIDO.match(prev_c) or _RE_ACCESORIO_CTX.search(prev_c):
+                continue
+            if re.search(
+                r"(?i)^(a[nñ]o|year|edici[oó]n|color|cantidad|marca|modelo|cant|"
+                r"identificaci[oó]n|cotizado|datos del)\b",
+                prev_c,
+            ):
+                continue
+            titulo_ficha = prev_c
+            break
+        if titulo_ficha:
+            break
+
+    mejor_val, mejor_titulo = 0.0, None
+    for m, val, _cur in _iter_montos(t):
+        if _rol_importe(t, m, val) != "detalle":
+            continue
+        tit = _titulo_desde_contexto(t[max(0, m.start() - 280): m.start()])
+        if not tit:
+            continue
+        if val >= mejor_val:
+            mejor_val, mejor_titulo = val, tit
+
+    if titulo_ficha and not _titulo_vehiculo_ok(titulo_ficha):
+        titulo_ficha = None
+    if mejor_titulo and not _titulo_vehiculo_ok(mejor_titulo):
+        mejor_titulo, mejor_val = None, 0.0
+    titulo = titulo_ficha or mejor_titulo
+    marca, modelo = _partir_nombre_comercial(titulo) if titulo else (None, None)
+    return marca, modelo, mejor_val, titulo
+
+
+def extraer_maximo_linea_vehiculo(texto):
+    """Mayor importe de una fila de detalle (cualquier layout: $, CLP, miles chilenos)."""
+    t = texto or ""
+    hits = list(_iter_montos(t))
+    mejor = 0.0
+    i = 0
+    while i < len(hits):
+        m, val, _cur = hits[i]
+        rol = _rol_importe(t, m, val)
+        if rol != "detalle":
+            i += 1
+            continue
+        cluster = [val]
+        j = i + 1
+        while j < len(hits) and hits[j][0].start() - hits[j - 1][0].end() < 48:
+            mj, vj, _ = hits[j]
+            rol_j = _rol_importe(t, mj, vj)
+            if rol_j in ("total", "pie"):
+                break
+            if rol_j == "detalle":
+                cluster.append(vj)
+            j += 1
+        importe = max(cluster)
+        if importe > mejor:
+            mejor = importe
+        i = max(j, i + 1)
+    return mejor
 
 
 def extraer_hechos_del_texto(texto):
@@ -851,17 +1115,35 @@ def extraer_hechos_del_texto(texto):
         if modelo and not _es_placeholder(modelo) and modelo.lower() not in _MODELO_GENERICO:
             hechos["modelo"] = modelo
 
-    cat_m, cat_mod = extraer_vehiculo_catalogo(t)
+    prod_m, prod_mod, prod_precio, prod_titulo = extraer_producto_principal(t)
+    if prod_m and _es_placeholder(hechos.get("marca")):
+        hechos["marca"] = prod_m
+    if prod_mod and _es_placeholder(hechos.get("modelo")):
+        hechos["modelo"] = prod_mod
+
+    ambito_cat = " ".join(
+        x for x in (prod_titulo, hechos.get("marca"), hechos.get("modelo")) if x
+    ).strip()
+    cat_m, cat_mod = extraer_vehiculo_catalogo(ambito_cat) if ambito_cat else (None, None)
+    if not cat_m and _es_placeholder(hechos.get("marca")):
+        cat_m, cat_mod = extraer_vehiculo_catalogo(t, exigir_modelo=True)
     fuzzy_h = buscar_vehiculo_fuzzy(hechos.get("marca"), hechos.get("modelo"))
-    if cat_m and (not fuzzy_h[0] or _es_placeholder(hechos.get("marca"))):
+    if cat_m and _es_placeholder(hechos.get("marca")):
         hechos["marca"] = cat_m
-        if cat_mod and (_es_placeholder(hechos.get("modelo")) or not fuzzy_h[1]):
+        if cat_mod and _es_placeholder(hechos.get("modelo")):
             corto = " ".join(_tokens_vehiculo(cat_mod)[:3]).title()
             hechos["modelo"] = corto or cat_mod
-    elif fuzzy_h[0]:
+    elif (
+        cat_m
+        and cat_mod
+        and _es_placeholder(hechos.get("modelo"))
+        and _norm_ocr(hechos.get("marca") or "") == _norm_ocr(cat_m)
+    ):
+        corto = " ".join(_tokens_vehiculo(cat_mod)[:3]).title()
+        hechos["modelo"] = corto or cat_mod
+    elif fuzzy_h[0] and fuzzy_h[1] and _es_placeholder(hechos.get("modelo")):
         hechos["marca"] = fuzzy_h[0]
-        if hechos.get("modelo") and fuzzy_h[1]:
-            pass
+        hechos["modelo"] = " ".join(_tokens_vehiculo(fuzzy_h[1])[:3]).title() or fuzzy_h[1]
 
     beneficiario = extraer_nombre_comprador(t)
     if beneficiario and _nombre_ok(beneficiario):
@@ -869,7 +1151,12 @@ def extraer_hechos_del_texto(texto):
 
     etiquetas_total = (
         r"valor\s+total",
+        r"valor\s+a\s+pagar",
         r"total\s*a?\s*pagar",
+        r"monto\s+(?:total|a\s+pagar)",
+        r"total\s+general",
+        r"total\s+documento",
+        r"importe\s+total",
         r"total\s+(?:factura|proforma|referencial|cotizaci[oó]n|presupuesto)",
         r"(?<![a-záéíóúñ])total\s*:",
     )
@@ -886,8 +1173,11 @@ def extraer_hechos_del_texto(texto):
         t,
         (
             r"precio\s+neto(?:\s+veh[ií]culo)?",
-            r"p(?:recio)?\.?\s*unitario",
+            r"valor\s+neto(?:\s+veh[ií]culo)?",
+            r"p(?:recio)?\.?\s*unit(?:ario|\.?)?",
             r"precio\s+unitario",
+            r"valor\s+unitario",
+            r"v\.?\s*unitario",
         ),
     )
     if neto <= 0:
@@ -902,9 +1192,15 @@ def extraer_hechos_del_texto(texto):
             )
         if m_veh:
             neto = parse_costo(m_veh.group(1), reparar_concatenado=False)
+    neto_etiqueta = neto
+    neto_tabla = extraer_maximo_linea_vehiculo(t)
+    if neto_tabla > 0:
+        neto = neto_tabla
+    elif neto <= 0 and prod_precio > 0:
+        neto = prod_precio
 
     recon = _reconstruir_total_lineas(t)
-    if recon > 0:
+    if recon > 0 and not candidatos_total:
         candidatos_total.append(recon)
 
     uniq_tot = []
@@ -926,7 +1222,7 @@ def extraer_hechos_del_texto(texto):
             alt = parse_costo(s[1:], reparar_concatenado=False)
             if neto * 0.95 <= alt <= neto * 1.6:
                 total = alt
-    if neto > total > 0:
+    if neto > total > 0 and neto > total * 1.12:
         s = str(int(round(neto)))
         if len(s) >= 3:
             alt = parse_costo(s[1:], reparar_concatenado=False)
@@ -943,6 +1239,14 @@ def extraer_hechos_del_texto(texto):
         total = recon
     if total > 0 and not _monto_parece_vehiculo(total):
         total = 0.0
+    if (
+        neto_etiqueta > 0
+        and total > 0
+        and abs(neto - total) < 1
+        and neto_etiqueta < total * 0.98
+        and _monto_parece_vehiculo(neto_etiqueta)
+    ):
+        neto = neto_etiqueta
     if total > 0:
         hechos["costo_total"] = total
     if neto > 0:
@@ -994,8 +1298,13 @@ def aplicar_hechos(datos, hechos):
     neto_final = parse_costo(out.get("costo_mas_alto"), reparar_concatenado=False)
     if neto_final <= 0 and total_final > 0:
         out["costo_mas_alto"] = total_final
-    elif neto_final > total_final > 0:
-        out["costo_mas_alto"] = total_final
+    elif neto_final > total_final * 1.25 > 0:
+        s = str(int(round(neto_final)))
+        alt = parse_costo(s[1:], reparar_concatenado=False) if len(s) >= 3 else 0.0
+        if 0 < alt <= total_final:
+            out["costo_mas_alto"] = alt
+        else:
+            out["costo_mas_alto"] = total_final
 
     ben_llm = out.get("beneficiario")
     ben_txt = hechos.get("beneficiario")
@@ -1004,23 +1313,24 @@ def aplicar_hechos(datos, hechos):
         out["beneficiario"] = elegido
     elif not _nombre_ok(ben_llm):
         out["beneficiario"] = None
-    if hechos.get("marca") and (
-        _es_placeholder(out.get("marca"))
-        or str(out.get("marca") or "").strip().lower() in COLORES_NO_MARCA
-        or (
-            buscar_vehiculo_fuzzy(hechos.get("marca"), hechos.get("modelo") or out.get("modelo"))[0]
-            and not buscar_vehiculo_fuzzy(out.get("marca"), out.get("modelo"))[0]
-        )
-    ):
-        out["marca"] = hechos["marca"]
-    if hechos.get("modelo") and (
-        _es_placeholder(out.get("modelo"))
-        or (
-            buscar_vehiculo_fuzzy(out.get("marca") or hechos.get("marca"), hechos.get("modelo"))[1]
-            and not buscar_vehiculo_fuzzy(out.get("marca"), out.get("modelo"))[1]
-        )
-    ):
-        out["modelo"] = hechos["modelo"]
+    if hechos.get("marca") or hechos.get("modelo"):
+        hm, hmod = hechos.get("marca"), hechos.get("modelo")
+        om, omod = out.get("marca"), out.get("modelo")
+        hechos_ok = not _es_placeholder(hm) and not _es_placeholder(hmod)
+        out_ok = not _es_placeholder(om) and not _es_placeholder(omod)
+        if hechos_ok and not out_ok:
+            out["marca"], out["modelo"] = hm, hmod
+        elif hechos_ok:
+            hit_h = buscar_vehiculo_fuzzy(hm, hmod)
+            hit_o = buscar_vehiculo_fuzzy(om, omod)
+            if hit_h[0] and not hit_o[0]:
+                out["marca"], out["modelo"] = hm, hmod
+            elif not hit_o[0]:
+                out["marca"], out["modelo"] = hm, hmod
+        elif _es_placeholder(om) and not _es_placeholder(hm):
+            out["marca"] = hm
+        elif _es_placeholder(omod) and not _es_placeholder(hmod):
+            out["modelo"] = hmod
     return normalizar_datos_llm(out)
 
 
@@ -1116,8 +1426,15 @@ def evaluar_extraccion(datos):
         datos["costo_mas_alto"] = costo_total
         costo_mas_alto = costo_total
 
-    if costo_mas_alto > costo_total > 0:
-        datos["costo_mas_alto"] = costo_total
+    if costo_mas_alto > costo_total * 1.25 > 0:
+        s = str(int(round(costo_mas_alto)))
+        alt = parse_costo(s[1:], reparar_concatenado=False) if len(s) >= 3 else 0.0
+        if 0 < alt <= costo_total:
+            datos["costo_mas_alto"] = alt
+            costo_mas_alto = alt
+        else:
+            datos["costo_mas_alto"] = costo_total
+            costo_mas_alto = costo_total
 
     ci_original = str(datos.get("ci") or "").strip()
     ci_limpio = limpiar_ci(ci_original)
@@ -1154,12 +1471,16 @@ def evaluar_extraccion(datos):
     if marca and str(marca).strip().lower() in COLORES_NO_MARCA:
         errores.append(f"La marca extraída parece un color ('{marca}')")
 
-    marca_base, modelo_base = buscar_vehiculo_fuzzy(marca, modelo)
-    datos["marca_base"] = marca_base if marca_base else "NO ENCONTRADO"
-    datos["modelo_base"] = modelo_base if modelo_base else "NO ENCONTRADO"
-
-    if not marca_base or not modelo_base:
-        errores.append(f"Vehículo no existe en BD o similitud baja ({marca or '-'} {modelo or '-'})")
+    if _es_placeholder(marca) or _es_placeholder(modelo):
+        errores.append("Falta marca/modelo en el documento")
+        datos["marca_base"] = "NO ENCONTRADO"
+        datos["modelo_base"] = "NO ENCONTRADO"
+    else:
+        marca_base, modelo_base = buscar_vehiculo_fuzzy(marca, modelo)
+        datos["marca_base"] = marca_base if marca_base else "NO ENCONTRADO"
+        datos["modelo_base"] = modelo_base if modelo_base else "NO ENCONTRADO"
+        if not marca_base or not modelo_base:
+            errores.append(f"Vehículo no existe en BD o similitud baja ({marca or '-'} {modelo or '-'})")
 
     if errores:
         return False, " | ".join(errores)
@@ -1188,11 +1509,13 @@ REGLAS:
 3. ci: solo dígitos. Puede ser cédula de persona o RUT/RUC de empresa compradora. Nunca un precio.
 4. beneficiario: persona natural O razón social/empresa que compra. Nunca el emisor, nunca un RUT, nunca "cliente"/"proveedor", nunca la marca.
 5. costo_total = total a pagar / valor total / total factura, no un subtotal ni IVA.
-6. costo_mas_alto = precio neto o unitario del vehículo, no un accesorio. Puede ser menor que el total.
+6. costo_mas_alto = precio del ítem vehicular más caro de la TABLA (P. unitario o total de esa fila). No un accesorio, no un subtotal, no el total a pagar. Puede ser MAYOR que el total si hay descuento.
 7. Números con punto decimal y SIN miles. Chile: 37.344.066 → 37344066. Ecuador: 48,500.00 → 48500.00
-8. Marca comercial del VEHÍCULO (bloque marca/modelo o detalle), nunca un color ni el nombre de la concesionaria.
-9. Si un campo no está (plantilla vacía), null (costos 0.0).
-10. Importes: transcribe TODOS los dígitos. Chile 86.939.122 → 86939122. No recortes ni inventes.
+8. Marca y modelo del VEHÍCULO (ficha, descripción del ítem más caro o bloque marca/modelo). Nunca un color, nunca la concesionaria, nunca un accesorio.
+9. Si NO hay etiquetas Marca/Modelo, usa el nombre comercial del ítem vehicular más caro: primera palabra = marca, el resto = modelo.
+10. Nunca tomes la marca de un accesorio (cargador, wallbox, seguro, placas, matrícula, flete).
+11. Si un campo no está (plantilla vacía), null (costos 0.0).
+12. Importes: transcribe TODOS los dígitos. Chile 86.939.122 → 86939122. No recortes ni inventes.
 """.strip()
 
 
@@ -1471,6 +1794,7 @@ def requiere_reextraccion(motivo_fallo, es_nativo=True):
         "demasiado corto",
         "mal formado",
         "parece un color",
+        "falta marca",
     )
     if not es_nativo:
         recuperables = recuperables + ("vehículo no existe", "vehiculo no existe", "similitud baja")
@@ -1496,20 +1820,25 @@ def fusionar_sin_pisar(datos_1, datos_2):
                 base[campo] = elegido
             continue
         if campo in ("marca", "modelo"):
-            if _es_placeholder(val_base) and not _es_placeholder(val_extra):
-                base[campo] = val_extra
-            elif not _es_placeholder(val_extra) and not _es_placeholder(val_base):
-                marca_b = val_base if campo == "marca" else base.get("marca")
-                modelo_b = val_base if campo == "modelo" else base.get("modelo")
-                marca_e = val_extra if campo == "marca" else (base.get("marca") or extra.get("marca"))
-                modelo_e = val_extra if campo == "modelo" else (base.get("modelo") or extra.get("modelo"))
-                hit_b = buscar_vehiculo_fuzzy(marca_b, modelo_b)[0]
-                hit_e = buscar_vehiculo_fuzzy(marca_e, modelo_e)[0]
-                if hit_e and not hit_b:
-                    base[campo] = val_extra
             continue
         if _es_placeholder(val_base) and val_extra and not _es_placeholder(val_extra):
             base[campo] = val_extra
+    hm, hmod = extra.get("marca"), extra.get("modelo")
+    om, omod = base.get("marca"), base.get("modelo")
+    extra_ok = not _es_placeholder(hm) and not _es_placeholder(hmod)
+    base_ok = not _es_placeholder(om) and not _es_placeholder(omod)
+    if extra_ok and not base_ok:
+        base["marca"], base["modelo"] = hm, hmod
+    elif extra_ok and base_ok:
+        hit_e = buscar_vehiculo_fuzzy(hm, hmod)
+        hit_b = buscar_vehiculo_fuzzy(om, omod)
+        if hit_e[0] and not hit_b[0]:
+            base["marca"], base["modelo"] = hm, hmod
+    elif not base_ok:
+        if _es_placeholder(om) and not _es_placeholder(hm):
+            base["marca"] = hm
+        if _es_placeholder(omod) and not _es_placeholder(hmod):
+            base["modelo"] = hmod
     return normalizar_datos_llm(base)
 
 
@@ -1845,7 +2174,9 @@ def extraer_y_validar(texto, imagenes_doc, es_nativo):
     es_valido, msj = evaluar_extraccion(datos)
     score_montos = _score_par_montos(datos.get("costo_mas_alto"), datos.get("costo_total"))
 
-    if es_nativo:
+    falta_id = _es_placeholder(datos.get("marca")) or _es_placeholder(datos.get("modelo"))
+
+    if es_nativo and not falta_id:
         if es_valido or not requiere_reextraccion(msj, es_nativo=True):
             if not es_valido:
                 print(f"\n[FALLO: {msj}] Sin reintento de modelo: el texto ya cubre los campos; queda catálogo/validación.")
@@ -1860,16 +2191,27 @@ def extraer_y_validar(texto, imagenes_doc, es_nativo):
         )
         datos = aplicar_hechos(fusionar_sin_pisar(datos, datos_2), hechos)
         es_valido, msj = evaluar_extraccion(datos)
+        falta_id = _es_placeholder(datos.get("marca")) or _es_placeholder(datos.get("modelo"))
+        if not falta_id or not imagenes_doc:
+            return datos, es_valido, msj
+
+    necesita_vision = falta_id or (
+        not es_nativo
+        and (
+            (not es_valido and requiere_reextraccion(msj, es_nativo=False))
+            or score_montos < 0.8
+            or not _monto_parece_vehiculo(datos.get("costo_total"))
+        )
+    )
+    if not necesita_vision:
+        return datos, es_valido, msj
+    if not imagenes_doc:
+        if falta_id:
+            print("[INFO] Marca/modelo no están en el texto y no hay imagen para MiniCPM-V.")
         return datos, es_valido, msj
 
-    necesita_vision = (
-        not es_valido
-        and requiere_reextraccion(msj, es_nativo=False)
-    ) or score_montos < 0.8 or not _monto_parece_vehiculo(datos.get("costo_total"))
-    if es_valido and not necesita_vision:
-        return datos, es_valido, msj
-
-    print(f"\n[FALLO INTENTO 1: {msj}]. Escaneado: MiniCPM-V una pasada visual.")
+    origen = "sin marca/modelo en texto" if falta_id else "escaneado dudoso"
+    print(f"\n[FALLO INTENTO 1: {msj}]. {origen}: MiniCPM-V una pasada visual.")
     datos_2 = extraer_con_minicpm(imagenes_doc, max_reintentos=2)
     datos = fusionar_sin_pisar(datos, datos_2)
     datos = aplicar_hechos(datos, hechos)
@@ -1972,6 +2314,20 @@ def procesar_archivo_interno(ruta_archivo):
             if faltan and es_pdf:
                 imagenes_por_idx.update(rasterizar_paginas(ruta_archivo, faltan))
             imagenes_doc = [imagenes_por_idx[idx] for idx in doc["paginas"] if idx in imagenes_por_idx]
+
+        if not imagenes_doc:
+            hechos_prev = extraer_hechos_del_texto(texto_analizar)
+            if _es_placeholder(hechos_prev.get("marca")) or _es_placeholder(hechos_prev.get("modelo")):
+                print("[INFO] Sin marca/modelo etiquetados. Rasterizando para MiniCPM-V...")
+                idxs = list(doc["paginas"][:2])
+                if es_pdf:
+                    imagenes_por_idx.update(rasterizar_paginas(ruta_archivo, idxs))
+                elif idxs:
+                    try:
+                        imagenes_por_idx[0] = Image.open(ruta_archivo).convert("RGB")
+                    except Exception:
+                        pass
+                imagenes_doc = [imagenes_por_idx[idx] for idx in doc["paginas"] if idx in imagenes_por_idx]
 
         datos_finales, es_valido, msj = extraer_y_validar(texto_analizar, imagenes_doc, es_nativo)
 

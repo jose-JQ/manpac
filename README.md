@@ -17,7 +17,7 @@ A partir de un documento, el sistema intenta obtener:
 | `cantidad` | Unidades |
 | `beneficiario` | Nombre o razón social del comprador (persona o empresa) |
 | `ci` | Cédula, RUT o RUC del **comprador** (nunca del vendedor) |
-| `costo_mas_alto` | Ítem vehicular más caro (neto o referencial) |
+| `costo_mas_alto` | Ítem vehicular más caro de la tabla de detalle (puede ser mayor que el total si hay descuento) |
 | `costo_total` | Total a pagar |
 | `estado` | `ÉXITO` o `REVISIÓN (...motivo...)` |
 | `paginas_pdf` | Páginas del PDF que formaron esa factura |
@@ -107,9 +107,11 @@ Cada documento lógico se guarda como fragmento PDF en `procesados_exito/` o `re
 
 ### 3. Extracción (anclas + Qwen)
 
-1. **Hechos regex** (`extraer_hechos_del_texto`): comprador vs vendedor, CI/RUT/RUC, razón social o nombre, marca/modelo (también contra el catálogo), montos coherentes con IVA 0/12/15/19 % y reconstrucción de ítems si el OCR cambia un dígito.
+1. **Hechos regex** (`extraer_hechos_del_texto`): comprador vs vendedor, CI/RUT/RUC, razón social o nombre, marca/modelo, montos coherentes con IVA 0/12/15/19 % y reconstrucción de ítems si el OCR cambia un dígito.
+   - Si **no hay** etiquetas `Marca:` / `Modelo:`, usa la ficha técnica (línea sobre batería/autonomía) o la descripción del ítem más caro. Ignora accesorios (`Smart Wallbox`, cargador, kit, placas).
+   - Una marca de catálogo suelta (p. ej. la palabra "Smart" en un accesorio) **no** elige un modelo al azar ni marca ÉXITO.
 2. **Qwen 2.5 3B** (`qwen2.5:3b`) convierte el texto en JSON, con esos hechos como pista.
-3. `aplicar_hechos` veta el RUC/RUT del **vendedor** como CI del comprador, elige el mejor par de montos y confirma marca/modelo si el catálogo ya los vio en el texto.
+3. `aplicar_hechos` veta el RUC/RUT del **vendedor** como CI del comprador, elige el mejor par de montos y, si el texto ya trajo un nombre comercial completo, no lo deja pisar por un accesorio.
 
 El comprador puede ser **persona** (cédula 8–10 dígitos) o **empresa** (RUT chileno o RUC ecuatoriano de 13). Se descartan RUC dummy tipo `0999999999001`.
 
@@ -118,7 +120,8 @@ El comprador puede ser **persona** (cédula 8–10 dígitos) o **empresa** (RUT 
 | Caso | Qué hace |
 | --- | --- |
 | Nativo y faltan CI, nombre o costos | Segundo pase de **Qwen** (sin visión) |
-| Nativo y el vehículo no está en el catálogo | Queda en **REVISIÓN**. MiniCPM-V no entra: el texto ya se leyó bien |
+| Nativo y **no hay marca/modelo en el texto** (solo logo o foto) | Raster + **MiniCPM-V** |
+| Nativo y el vehículo se leyó pero no está en el catálogo | Queda en **REVISIÓN**. MiniCPM-V no entra |
 | Escaneo y faltan campos, montos incoherentes, total poco creíble o el vehículo no calza | **MiniCPM-V** lee hasta 2 páginas como imagen y se fusiona sin pisar un costo bueno |
 
 No hay un tercer modelo “juez”. Llama 3.1 **no** forma parte del flujo.

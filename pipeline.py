@@ -97,46 +97,36 @@ def opciones_ollama(temperature=0.0, **extra):
     return opts
 
 
-def _mover_doctr(device):
-    global modelo_doctr
-    if modelo_doctr is None:
-        return
+def _chat_ollama(timeout, **kwargs):
+    cliente = ollama.Client(timeout=timeout)
+    return cliente.chat(**kwargs)
+
+
+def _liberar_modelo_ollama(modelo):
+    """Saca Qwen de VRAM para que MiniCPM-V quepa en la GPU (como ayer)."""
     try:
-        if hasattr(modelo_doctr, "to"):
-            modelo_doctr.to(device)
-        else:
-            for attr in ("det_predictor", "reco_predictor"):
-                parte = getattr(modelo_doctr, attr, None)
-                modelo = getattr(parte, "model", None) if parte is not None else None
-                if modelo is not None and hasattr(modelo, "to"):
-                    modelo.to(device)
-        if device == "cpu":
-            import gc
-            gc.collect()
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
-    except Exception as e:
-        print(f"[INFO] No se pudo mover DocTR a {device}: {e}")
+        print(f"[INFO] Liberando {modelo} de la GPU...")
+        ollama.Client(timeout=20).chat(
+            model=modelo,
+            messages=[{"role": "user", "content": "."}],
+            keep_alive=0,
+            options={"num_predict": 1, "temperature": 0},
+        )
+    except Exception:
+        pass
 
 
 def preparar_gpu_para_ollama():
-    """Qwen y MiniCPM-V necesitan la VRAM libre. DocTR sale de la gráfica antes de Ollama."""
-    if modelo_doctr is not None and _gpu_cache.get("torch") == "cuda":
-        print("[INFO] GPU: DocTR → CPU, Ollama usa la gráfica.")
-        _mover_doctr("cpu")
+    """Ollama usa la GPU en su propio proceso. No tocar CUDA desde PyTorch: en Windows se cuelga."""
+    return
 
 
 def _log_aceleracion(contexto=""):
     global _aceleracion_impresa
     ol = "GPU" if usar_gpu_ollama() else "CPU"
-    dt = _gpu_cache.get("torch", "aún no cargado")
     msg = (
         f"[INFO] Aceleración{(' ' + contexto) if contexto else ''}: "
-        f"Ollama={ol} | DocTR/PyTorch={dt}"
+        f"Ollama={ol} | DocTR=CPU (no comparte CUDA)"
     )
     if not _aceleracion_impresa or contexto:
         print(msg)
@@ -234,15 +224,18 @@ CAMPOS_EXTRACCION = ("marca", "modelo", "cantidad", "beneficiario", "ci", "costo
 
 
 def get_modelo_doctr():
+    """Siempre CPU. Compartir la GPU con Ollama bloquea el proceso en Windows."""
     global modelo_doctr
-    device = dispositivo_torch()
     if modelo_doctr is None:
-        print(f"Cargando modelo neuronal DocTR en {device}...")
+        print("Cargando DocTR en CPU (la GPU queda para Ollama)...")
         from doctr.models import ocr_predictor
         modelo_doctr = ocr_predictor(det_arch='db_resnet50', reco_arch='crnn_vgg16_bn', pretrained=True)
+        try:
+            if hasattr(modelo_doctr, "to"):
+                modelo_doctr = modelo_doctr.to("cpu")
+        except Exception:
+            pass
         _log_aceleracion("DocTR")
-    if device != "cpu":
-        _mover_doctr(device)
     return modelo_doctr
 
 
@@ -548,6 +541,11 @@ def _nombre_ok(nom):
     if re.search(r"(?i)\b(?:vendedor|proveedor|emisor|detalle|concepto|precio|total|iva|neto)\b", s):
         return False
     if "$" in s or re.search(r"\d{1,3}([.,]\d{3}){2,}", s):
+        return False
+    letras_sueltas = sum(
+        1 for t in s.split() if len(re.sub(r"[^A-Za-záéíóúñÁÉÍÓÚÑ]", "", t)) <= 1
+    )
+    if letras_sueltas >= 4:
         return False
     return True
 
@@ -1807,14 +1805,51 @@ def es_pagina_nativa(pdf_page):
 def extraer_texto_doctr(imagen_pil):
     from doctr.io import DocumentFile
 
+    img = _imagen_para_ocr(imagen_pil)
+    if img is None:
+        return ""
     buf = BytesIO()
-    imagen_pil.convert("RGB").save(buf, format="PNG")
+    img.save(buf, format="JPEG", quality=85)
+    print("[INFO] DocTR (CPU, puede tardar la primera vez)...")
     res = get_modelo_doctr()(DocumentFile.from_images(buf.getvalue()))
     texto = ""
     for page in res.pages:
         for block in page.blocks:
             texto += " ".join([w.value for line in block.lines for w in line.words]) + "\n"
     return texto.strip()
+
+
+def _imagen_para_ocr(imagen_pil, lado_max=1600):
+    if imagen_pil is None:
+        return None
+    img = imagen_pil.convert("RGB")
+    w, h = img.size
+    mayor = max(w, h)
+    if mayor > lado_max:
+        scale = lado_max / mayor
+        img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.BILINEAR)
+    return img
+
+
+def extraer_texto_ocr(imagen_pil):
+    """Un pase Tesseract con timeout. Sin OSD ni DocTR salvo texto casi vacío."""
+    img = _imagen_para_ocr(imagen_pil)
+    if img is None:
+        return ""
+    print(f"[INFO] Tesseract {img.size[0]}x{img.size[1]}...")
+    try:
+        texto = pytesseract.image_to_string(img, lang="spa", config="--oem 1 --psm 6", timeout=20) or ""
+    except Exception as e:
+        print(f"[⚠️ Tesseract: {e}]")
+        texto = ""
+    if len(texto.strip()) < 40:
+        try:
+            t4 = pytesseract.image_to_string(img, lang="spa", config="--oem 1 --psm 4", timeout=15) or ""
+            if t4.strip():
+                texto = (texto + "\n" + t4).strip()
+        except Exception as e:
+            print(f"[⚠️ Tesseract psm4: {e}]")
+    return (texto or "").strip()
 
 
 TESS_CFG = "--oem 1 --psm 6"
@@ -1858,66 +1893,6 @@ def _parece_texto_invertido(texto):
     invertido = " ".join(w[::-1] for w in re.findall(r"[A-Za-záéíóúñÁÉÍÓÚÑ]{4,}", t))
     n_inv = len(re.findall(claves, invertido))
     return n_inv >= 2 and n_inv > n_ok
-
-
-def _rotar_osd(img):
-    try:
-        osd = pytesseract.image_to_osd(img)
-        m = re.search(r"Rotate:\s*(\d+)", osd)
-        if m:
-            ang = int(m.group(1)) % 360
-            if ang:
-                return img.rotate(360 - ang, expand=True, fillcolor="white")
-    except Exception:
-        pass
-    return img
-
-
-def extraer_texto_ocr(imagen_pil):
-    """Tesseract primero; OSD/psm 4/DocTR solo si el primer pase es pobre."""
-    if imagen_pil is None:
-        return ""
-    img = imagen_pil.convert("RGB")
-    w, h = img.size
-    if max(w, h) < 1400:
-        scale = 1400 / max(w, h)
-        img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
-
-    texto = pytesseract.image_to_string(img, lang="spa", config="--oem 1 --psm 6") or ""
-    debil = _calidad_montos(texto) < 2 or _calidad_ocr(texto) < 120
-
-    if debil:
-        img = _rotar_osd(img)
-        t0 = pytesseract.image_to_string(img, lang="spa", config="--oem 1 --psm 6") or ""
-        t4 = pytesseract.image_to_string(img, lang="spa", config="--oem 1 --psm 4") or ""
-        texto = t0
-        if _calidad_montos(t4) > _calidad_montos(texto) or _calidad_ocr(t4) > _calidad_ocr(texto):
-            texto = (texto + "\n" + t4).strip() if texto else t4
-        elif t4 and t4.strip() != (t0 or "").strip():
-            texto = (texto + "\n" + t4).strip()
-
-    if _parece_texto_invertido(texto) or _calidad_ocr(texto) < 140:
-        t180 = pytesseract.image_to_string(
-            img.rotate(180, expand=True, fillcolor="white"),
-            lang="spa",
-            config="--oem 1 --psm 6",
-        )
-        q0, q180 = _calidad_ocr(texto), _calidad_ocr(t180)
-        if q180 > q0 * 1.1 and q180 > 80:
-            texto = t180
-        elif _ocr_tiene_cliente(t180) and not _ocr_tiene_cliente(texto):
-            texto = (texto or "") + "\n" + (t180 or "")
-        elif _parece_texto_invertido(texto) and q180 > 40:
-            texto = (texto or "") + "\n" + (t180 or "")
-
-    if _calidad_montos(texto) < 2 or _calidad_ocr(texto) < 120:
-        try:
-            td = extraer_texto_doctr(img)
-            if td:
-                texto = ((texto or "") + "\n" + td).strip()
-        except Exception as e:
-            print(f"[⚠️ DocTR: {e}]")
-    return (texto or "").strip()
 
 
 def _combinar_textos(nativo, ocr):
@@ -1974,9 +1949,9 @@ def estructurar_con_llm(texto, modelo="qwen2.5:3b", intento_nombre=None, motivo_
         )
     prompt = f"{PROMPT_CAMPOS}{extra}\nTEXTO:\n{texto}"
     try:
-        preparar_gpu_para_ollama()
         _log_aceleracion("Qwen")
-        res = ollama.chat(
+        res = _chat_ollama(
+            120,
             model=modelo,
             format='json',
             messages=[{'role': 'user', 'content': prompt}],
@@ -1992,7 +1967,7 @@ def estructurar_con_llm(texto, modelo="qwen2.5:3b", intento_nombre=None, motivo_
         return {"error": str(e)}
 
 
-def extraer_con_minicpm(imagenes_pil, max_reintentos=2):
+def extraer_con_minicpm(imagenes_pil, max_reintentos=1):
     img_b64 = []
     for img in imagenes_pil[:2]:
         img_resized = img.copy()
@@ -2006,16 +1981,18 @@ def extraer_con_minicpm(imagenes_pil, max_reintentos=2):
         + "\nAnaliza la imagen. ci va entre comillas y solo con dígitos de cédula/RUT/RUC, nunca un precio."
         " beneficiario es el comprador: persona o razón social, nunca un RUT ni la marca del vehículo."
     )
+    _liberar_modelo_ollama("qwen2.5:3b")
+    print("[INFO] MiniCPM-V en GPU. La primera carga puede tardar 1-3 minutos; luego queda en memoria.")
     for intento in range(max_reintentos):
         txt = ""
         try:
-            preparar_gpu_para_ollama()
             _log_aceleracion("MiniCPM-V")
-            res = ollama.chat(
+            res = _chat_ollama(
+                300,
                 model='minicpm-v',
                 messages=[{'role': 'user', 'content': prompt, 'images': img_b64}],
                 options=opciones_ollama(0.1),
-                keep_alive="10m",
+                keep_alive="30m",
             )
             txt = res['message']['content'].strip()
             datos = normalizar_datos_llm(extraer_json_de_texto(txt))
@@ -2028,7 +2005,7 @@ def extraer_con_minicpm(imagenes_pil, max_reintentos=2):
             err = str(e).lower()
             if "failed to connect to ollama" in err or "connection refused" in err:
                 break
-            time.sleep(1)
+            time.sleep(2)
 
     return {"error": "MiniCPM-V falló en todos los reintentos."}
 
@@ -2400,7 +2377,7 @@ def guardar_documento_logico(ruta_origen, es_pdf, indices_paginas, ruta_destino)
     return ruta_destino
 
 
-def rasterizar_paginas(ruta_archivo, indices, dpi=250):
+def rasterizar_paginas(ruta_archivo, indices, dpi=180):
     """Convierte solo las páginas que hacen falta (escaneadas o MiniCPM)."""
     if not indices:
         return {}
@@ -2537,9 +2514,9 @@ def procesar_archivo_interno(ruta_archivo):
             p["imagen"] = img
             if img is None:
                 continue
+            print(f"[INFO] OCR página {p['idx'] + 1}...")
             texto = extraer_texto_ocr(img)
             p["texto"] = _combinar_textos(p.get("texto") or "", texto)
-        preparar_gpu_para_ollama()
 
     docs_logicos = segmentar_documentos_logicos(paginas_data)
 
@@ -2563,14 +2540,6 @@ def procesar_archivo_interno(ruta_archivo):
 
         es_nativo = not doc.get("tiene_escaneado", False)
         texto_analizar = doc["texto"] or ""
-
-        if (not es_nativo or len(texto_analizar.strip()) < 40) and doc.get("imagenes"):
-            imgs_faltantes = [img for img in doc["imagenes"] if img is not None]
-            if imgs_faltantes and len(texto_analizar.strip()) < 40:
-                print("[INFO] Texto insuficiente. Completando con DocTR...")
-                texto_ocr = "\n".join(extraer_texto_doctr(img) for img in imgs_faltantes)
-                texto_analizar = (texto_analizar + "\n" + texto_ocr).strip()
-                preparar_gpu_para_ollama()
 
         imagenes_doc = [img for img in (doc.get("imagenes") or []) if img is not None]
         if not imagenes_doc and not es_nativo:

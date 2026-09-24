@@ -2,7 +2,8 @@
 
 Sistema local para leer facturas y proformas de vehículos (PDF o imagen), extraer los datos clave con modelos de IA y validarlos contra un catálogo de vehículos eléctricos. Si la extracción es confiable, el registro entra al Excel de éxitos; si no, el archivo pasa a revisión manual.
 
-Probado en **Windows 10 + Python 3.14**.
+Probado en **Windows 10 + Python 3.14**. Los PDF/imágenes de desarrollo son **datos de prueba**, no plantillas: el extractor generaliza por roles (emisor vs comprador), etiquetas y tablas, no por un diseño fijo.
+
 https://github.com/jose-JQ/manpac/
 ---
 
@@ -143,6 +144,54 @@ Cada factura se `yield` a la API (la UI la pinta al momento).
 
 ---
 
+## Requisitos mínimos (con o sin GPU)
+
+El sistema **no exige GPU**. Si hay una NVIDIA (o CUDA en PyTorch), **el código la usa solo**: Ollama con `num_gpu` y DocTR en `cuda`. Sin GPU, el mismo flujo sigue en CPU. La GPU no cambia las reglas de validación.
+
+```mermaid
+flowchart TB
+    doc[PDF o imagen] --> tipo{¿Texto nativo?}
+    tipo -->|Sí| cpuOk[CPU basta: PyMuPDF + Qwen 3B]
+    tipo -->|Escaneo o foto| hw{¿GPU NVIDIA?}
+    hw -->|No| cpuScan[Tesseract en CPU. DocTR y MiniCPM-V lentos o inviables]
+    hw -->|Sí 6 GB+ VRAM| gpuScan[Tesseract + DocTR + MiniCPM-V usables]
+    hw -->|Sí 8 GB+ VRAM| gpuOk[Lote de escaneos fluido]
+```
+
+| | **Sin GPU (solo CPU)** | **Con GPU NVIDIA** |
+| --- | --- | --- |
+| **Mínimo para probar** | CPU 4 núcleos, **16 GB RAM**, 15 GB disco | Lo mismo + **6 GB VRAM** (apretado) |
+| **Uso diario** | 8 núcleos, 16–32 GB RAM | **8 GB+ VRAM**, 16 GB RAM |
+| **PDF nativo** | Bien | Bien (Qwen en GPU vía Ollama) |
+| **Escaneo / foto** | Tesseract sí. DocTR lento. MiniCPM-V minutos por página o timeout | DocTR + MiniCPM-V en GPU |
+| **Qué hace el código** | CPU automático | `num_gpu=99` en Ollama; DocTR `.to("cuda")` si `torch.cuda` está |
+
+**Software común a ambos**
+
+- Windows 10/11 (rutas de Poppler/Tesseract pensadas para Windows)
+- Python **3.11+**
+- Ollama en ejecución + modelos `qwen2.5:3b` (siempre) y `minicpm-v` (escaneos dudosos)
+- Tesseract con idioma `spa` y Poppler (solo páginas no nativas)
+
+**RAM aproximada en marcha**
+
+| Componente | CPU | GPU |
+| --- | --- | --- |
+| Qwen 2.5 3B (Ollama) | ~2–4 GB RAM | ~2–3 GB VRAM |
+| MiniCPM-V (Ollama) | 8 GB+ RAM, muy lento | ~5–8 GB VRAM cuantizado |
+| DocTR (PyTorch) | 1–2 GB RAM extra, lento | CUDA si el `torch` es CUDA |
+| Streamlit + FastAPI + SQLite | ~0.5 GB | igual |
+
+En **8 GB de RAM sin GPU** se pueden procesar PDF nativos cortos; no se recomienda DocTR + MiniCPM-V a la vez. AMD/Intel GPU en Windows: Ollama suele ir a CPU.
+
+Si no hay GPU, no hace falta `minicpm-v` para el camino nativo. Sin ese modelo, un escaneo difícil irá a **REVISIÓN** con lo que Tesseract (y DocTR, si carga) hayan leído.
+
+`instalar.bat` deja `torch` CPU y, si encuentra `nvidia-smi`, intenta reinstalar PyTorch CUDA (`cu124`) para que DocTR también use la GPU. Ollama **no** usa ese `torch`; tiene su propio runtime y el pipeline le pide GPU cuando hay NVIDIA. Forzar CPU: `set OLLAMA_NUM_GPU=0`.
+
+Si la rueda CUDA no existe para tu Python, DocTR se queda en CPU y Ollama igual puede usar la GPU.
+
+---
+
 ## Qué se necesita instalar
 
 ### 1. Python (pip)
@@ -207,7 +256,7 @@ set TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe
 
 ## Cómo arrancar
 
-1. Deja **Ollama** en ejecución.
+1. Deja **Ollama** en ejecución (`qwen2.5:3b`; `minicpm-v` si vas a mandar escaneos y tienes RAM/VRAM).
 2. Ejecuta `iniciar.bat` (abre API + UI).
 3. Abre http://localhost:8501
 4. En **Procesamiento por Lotes**, sube PDF/PNG/JPG y pulsa *Enviar al Servidor IA*.
@@ -261,14 +310,51 @@ Carpetas que se crean solas al procesar: `temp_api_uploads/`, `procesados_exito/
 
 ---
 
-## Limitaciones
+## Limitaciones de esta solución
 
-- Corre en local; no es un despliegue en la nube.
-- MiniCPM-V pide RAM/VRAM. En CPU, los escaneos dudosos serán lentos.
-- Vehículos que no existan en `vehiculos.db` (o con OCR muy pobre) salen como `REVISIÓN`.
-- Las rutas de Poppler/Tesseract están pensadas para Windows.
-- Los PDF de `docs/` son muestras de prueba, no plantillas: el extractor generaliza por roles y anclas, no por un diseño fijo.
+Esto es un extractor **local, híbrido (regex + LLM pequeño + catálogo)**, no un lector fiscal certificado.
 
+1. **El catálogo manda el ÉXITO.** Si la marca/modelo no está en `vehiculos.db` (o el fuzzy no llega al umbral), el documento va a **REVISIÓN aunque el papel se haya leído bien**. No se inventa un match (p. ej. GET ≠ AUDI). Ampliar la BD es la palanca de cobertura, no overfittear una factura de ejemplo.
+2. **Los ejemplos no son el producto.** Layouts, idiomas de sello, monedas y identificadores reales varían. El código busca roles y hechos, no un miembro/columna fijos. Un diseño nunca visto puede fallar; se corrige por reglas generales, no copiando el PDF de prueba.
+3. **PDF nativo ≫ escaneo ≫ manuscrito.** Sin texto embebido depende de Tesseract/DocTR y, si Ollama está, MiniCPM-V. Fotos torcidas, baja resolución o letra a mano bajan precisión. Si Ollama no corre, la visión no existe.
+4. **LLM pequeño (Qwen 3B).** Rellena JSON; las anclas regex tienen prioridad. Puede alucinar campos si el texto es pobre. No sustituye un modelo documental grande ni facturación electrónica (XML SRI/SII).
+5. **Identidad y montos son heurísticos.** Distingue emisor vs comprador, RUT/RUC/cédula, CLP vs USD e IVA 0/12/15/19 %, pero no valida dígito verificador chileno ni módulo 10 ecuatoriano de forma fiscal. Un total mal OCR-eado puede pasar el umbral de “parece precio”.
+6. **Un proceso a la vez.** Lotes en serie; Excel/SQLite no están pensados para muchos workers. MiniCPM-V mira como máximo 2 páginas del documento lógico.
+7. **Windows + local.** Poppler/Tesseract con rutas típicas de Windows. No hay cola, auth ni multi-usuario. Primer arranque de DocTR descarga pesos (hace falta red).
+8. **ÉXITO / REVISIÓN es binario.** No hay score de confianza por campo ni corrección humana que retroalimente el modelo.
 
-## Limitaciones
-Enlace de documentos de prueba: https://drive.google.com/file/d/1XIW_EGftxosJTgwKd1E8OlDa-6Of030a/view?usp=sharing
+Documentos de prueba (solo ejemplos, no plantillas): https://drive.google.com/file/d/1XIW_EGftxosJTgwKd1E8OlDa-6Of030a/view?usp=sharing
+
+---
+
+## Cómo hacerlo más eficiente y más preciso
+
+Orden práctico, de mayor impacto a menor. Nada de esto debe atarse a un PDF de `docs/`.
+
+### Precisión (calidad del dato)
+
+| Prioridad | Qué | Por qué |
+| --- | --- | --- |
+| 1 | **Mantener `vehiculos.db` al día** (marcas/modelos reales que van a llegar) | Cierra ÉXITO sin tocar el extractor. Un vehículo nuevo en papel y ausente en BD es REVISIÓN a propósito. |
+| 2 | **Preferir PDF nativo o XML** de factura electrónica cuando exista | El texto embebido evita OCR. El XML fiscal (SRI, SII, UBL) daría campos exactos; hoy no se consume. |
+| 3 | **Validadores de ID y de suma** | DV de RUT, dígito de cédula/RUC, y comprobar que neto + IVA ≈ total (± descuento). Rechaza lecturas “casi numéricas”. |
+| 4 | **Tablas nativas con parser de tabla** (`pdfplumber` / líneas de PyMuPDF), no solo regex de montos | Precio de línea y total salen de celdas, no de un número suelto cerca de “garantía 100.000 km”. |
+| 5 | **Visión solo cuando falte identidad o montos**, con un VLM más capaz *si hay GPU* (`qwen2.5-vl`, MiniCPM-V más grande) | El 3B de texto no “ve” el papel. Un VLM mejor ayuda en escaneos; en nativos no hace falta. |
+| 6 | **JSON acotado** (schema/salida forzada de Ollama) y fusión ancla-primero (ya hay veto de RUC vendedor) | Menos alucinaciones de CI y de marca de accesorio. |
+| 7 | **Cola de revisión con corrección** | El humano corrige marca/CI/monto; eso alimenta catálogo o un log de errores. Sin reentrenar, ya sube cobertura. |
+
+No subir el fuzzy “hasta que el ejemplo pase”: GET N230 no debe convertirse en un AUDI. Umbral alto + catálogo completo es más preciso que un match holgado.
+
+### Eficiencia (tiempo y máquina)
+
+| Prioridad | Qué | Por qué |
+| --- | --- | --- |
+| 1 | **No rasterizar ni llamar visión en PDF nativo** (ya es el diseño) | Ahorra Poppler, Tesseract, DocTR y MiniCPM-V. |
+| 2 | **GPU para Ollama** si el lote trae escaneos | MiniCPM-V en CPU no escala. En nativos, Qwen 3B en CPU es aceptable. |
+| 3 | **DocTR perezoso y condicional** (ya se carga al primer escaneo flojo) | No pagar PyTorch en un lote 100 % nativo. |
+| 4 | **Un solo reintento de visión; abortar si Ollama no responde** | Evita esperas dobles cuando el servicio está caído. |
+| 5 | **Bajar DPI de raster** (p. ej. 200) si la letra es clara; 250 solo si falla el monto | Menos píxeles = Tesseract/MiniCPM más rápidos. |
+| 6 | **`keep_alive` de Ollama** y no mezclar MiniCPM-V + DocTR + Qwen si la VRAM es justa | Menos cargas de modelo. En 6 GB, o texto o visión, no los tres. |
+| 7 | **Paralelizar documentos, no páginas a ciegas** | Un worker por archivo con lock en Excel. SQLite del catálogo es de lectura y ya va en memoria. |
+
+Regla corta: **catálogo completo + PDF nativo + anclas** da precisión. **GPU + visión** solo recupera escaneos. Los JSON de prueba sirven para regresión, no para enseñarle al sistema un único formato.

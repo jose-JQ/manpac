@@ -28,6 +28,8 @@ pytesseract.pytesseract.tesseract_cmd = os.environ.get(
     "TESSERACT_CMD",
     r"C:\Program Files\Tesseract-OCR\tesseract.exe",
 )
+MODELO_TEXTO = os.environ.get("OLLAMA_TEXTO", "qwen2.5:3b")
+MODELO_VISION = os.environ.get("OLLAMA_VISION", "qwen2.5vl:3b")
 
 CARPETA_REVISION = "revision_manual"
 CARPETA_EXITOSOS = "procesados_exito"
@@ -103,7 +105,7 @@ def _chat_ollama(timeout, **kwargs):
 
 
 def _liberar_modelo_ollama(modelo):
-    """Saca Qwen de VRAM para que MiniCPM-V quepa en la GPU (como ayer)."""
+    """Saca el LLM de texto de VRAM para que el modelo de visión quepa en la GPU."""
     try:
         print(f"[INFO] Liberando {modelo} de la GPU...")
         ollama.Client(timeout=20).chat(
@@ -1916,7 +1918,7 @@ def extraer_json_de_texto(txt):
     return json.loads(match.group(0))
 
 
-def estructurar_con_llm(texto, modelo="qwen2.5:3b", intento_nombre=None, motivo_fallo=None, hechos=None):
+def estructurar_con_llm(texto, modelo=None, intento_nombre=None, motivo_fallo=None, hechos=None):
     extra = ""
     if hechos and hechos.get("ci_vendedor"):
         extra += (
@@ -1948,6 +1950,7 @@ def estructurar_con_llm(texto, modelo="qwen2.5:3b", intento_nombre=None, motivo_
             "Corrige esos campos. No pongas 0.0 si el texto tiene un total.\n"
         )
     prompt = f"{PROMPT_CAMPOS}{extra}\nTEXTO:\n{texto}"
+    modelo = modelo or MODELO_TEXTO
     try:
         _log_aceleracion("Qwen")
         res = _chat_ollama(
@@ -1967,7 +1970,7 @@ def estructurar_con_llm(texto, modelo="qwen2.5:3b", intento_nombre=None, motivo_
         return {"error": str(e)}
 
 
-def extraer_con_minicpm(imagenes_pil, max_reintentos=1):
+def extraer_con_vision(imagenes_pil, max_reintentos=1):
     img_b64 = []
     for img in imagenes_pil[:2]:
         img_resized = img.copy()
@@ -1981,33 +1984,40 @@ def extraer_con_minicpm(imagenes_pil, max_reintentos=1):
         + "\nAnaliza la imagen. ci va entre comillas y solo con dígitos de cédula/RUT/RUC, nunca un precio."
         " beneficiario es el comprador: persona o razón social, nunca un RUT ni la marca del vehículo."
     )
-    _liberar_modelo_ollama("qwen2.5:3b")
-    print("[INFO] MiniCPM-V en GPU. La primera carga puede tardar 1-3 minutos; luego queda en memoria.")
+    _liberar_modelo_ollama(MODELO_TEXTO)
+    print(
+        f"[INFO] Visión {MODELO_VISION} en GPU. "
+        "Más liviano que MiniCPM-V; la primera carga suele ser < 1 min."
+    )
     for intento in range(max_reintentos):
         txt = ""
         try:
-            _log_aceleracion("MiniCPM-V")
+            _log_aceleracion(MODELO_VISION)
             res = _chat_ollama(
-                300,
-                model='minicpm-v',
+                180,
+                model=MODELO_VISION,
                 messages=[{'role': 'user', 'content': prompt, 'images': img_b64}],
                 options=opciones_ollama(0.1),
                 keep_alive="30m",
             )
             txt = res['message']['content'].strip()
             datos = normalizar_datos_llm(extraer_json_de_texto(txt))
-            print(f"\n--- RESPUESTA MINICPM-V (Intento {intento+1}) ---")
+            print(f"\n--- RESPUESTA VISIÓN {MODELO_VISION} (Intento {intento+1}) ---")
             print(json.dumps(datos, indent=2, ensure_ascii=False, default=str))
             return datos
         except Exception as e:
-            print(f"\n[⚠️ Error MiniCPM-V {intento+1}/{max_reintentos}]: {str(e)}")
+            print(f"\n[⚠️ Error {MODELO_VISION} {intento+1}/{max_reintentos}]: {str(e)}")
             print(f"Texto sin procesar recibido (para depuración):\n{txt[:300]}")
             err = str(e).lower()
             if "failed to connect to ollama" in err or "connection refused" in err:
                 break
             time.sleep(2)
 
-    return {"error": "MiniCPM-V falló en todos los reintentos."}
+    return {"error": f"{MODELO_VISION} falló en todos los reintentos."}
+
+
+def extraer_con_minicpm(imagenes_pil, max_reintentos=1):
+    return extraer_con_vision(imagenes_pil, max_reintentos=max_reintentos)
 
 
 def requiere_reextraccion(motivo_fallo, es_nativo=True):
@@ -2378,7 +2388,7 @@ def guardar_documento_logico(ruta_origen, es_pdf, indices_paginas, ruta_destino)
 
 
 def rasterizar_paginas(ruta_archivo, indices, dpi=180):
-    """Convierte solo las páginas que hacen falta (escaneadas o MiniCPM)."""
+    """Convierte solo las páginas que hacen falta (escaneadas o visión)."""
     if not indices:
         return {}
     poppler = PATH_POPPLER if PATH_POPPLER and os.path.isdir(PATH_POPPLER) else None
@@ -2396,12 +2406,12 @@ def rasterizar_paginas(ruta_archivo, indices, dpi=180):
 
 
 def extraer_y_validar(texto, imagenes_doc, es_nativo):
-    """Un LLM de texto + anclas regex. MiniCPM en escaneos si faltan campos, montos incoherentes o el vehículo no calza."""
+    """Un LLM de texto + anclas regex. Visión (Qwen2.5-VL 3B) en escaneos si faltan campos o montos."""
     hechos = extraer_hechos_del_texto(texto)
     print(f"[INFO] Hechos anclados del texto: {json.dumps(hechos, ensure_ascii=False, default=str)}")
 
     datos = estructurar_con_llm(
-        texto, modelo="qwen2.5:3b", intento_nombre="INTENTO 1 (Qwen texto)", hechos=hechos
+        texto, intento_nombre="INTENTO 1 (Qwen texto)", hechos=hechos
     )
     datos = aplicar_hechos(datos, hechos)
     es_valido, msj = evaluar_extraccion(datos)
@@ -2420,10 +2430,9 @@ def extraer_y_validar(texto, imagenes_doc, es_nativo):
             if not es_valido:
                 print(f"\n[FALLO: {msj}] Sin reintento de modelo: el texto ya cubre los campos; queda catálogo/validación.")
             return datos, es_valido, msj
-        print(f"\n[FALLO INTENTO 1: {msj}]. Reintento de texto con Qwen (sin MiniCPM-V).")
+        print(f"\n[FALLO INTENTO 1: {msj}]. Reintento de texto con Qwen (sin visión).")
         datos_2 = estructurar_con_llm(
             texto,
-            modelo="qwen2.5:3b",
             intento_nombre="INTENTO 2 (Qwen, campos faltantes)",
             motivo_fallo=msj,
             hechos=hechos,
@@ -2440,18 +2449,18 @@ def extraer_y_validar(texto, imagenes_doc, es_nativo):
         if not falta_id or not imagenes_doc:
             return datos, es_valido, msj
 
-    # Visión solo si OCR no trajo identidad o montos. Un fallo de catálogo no se arregla con MiniCPM-V.
+    # Visión solo si OCR no trajo identidad o montos. Un fallo de catálogo no se arregla con el VLM.
     necesita_vision = falta_id_o_persona or (not es_nativo and montos_mal)
     if not necesita_vision:
         return datos, es_valido, msj
     if not imagenes_doc:
         if falta_id:
-            print("[INFO] Marca/modelo no están en el texto y no hay imagen para MiniCPM-V.")
+            print("[INFO] Marca/modelo no están en el texto y no hay imagen para visión.")
         return datos, es_valido, msj
 
     origen = "sin marca/modelo en texto" if falta_id else "escaneado dudoso"
-    print(f"\n[FALLO INTENTO 1: {msj}]. {origen}: MiniCPM-V una pasada visual.")
-    datos_2 = extraer_con_minicpm(imagenes_doc, max_reintentos=1)
+    print(f"\n[FALLO INTENTO 1: {msj}]. {origen}: {MODELO_VISION} una pasada visual.")
+    datos_2 = extraer_con_vision(imagenes_doc, max_reintentos=1)
     datos = fusionar_sin_pisar(datos, datos_2)
     datos = aplicar_hechos(datos, hechos)
     if _score_par_montos(datos_2.get("costo_mas_alto"), datos_2.get("costo_total")) > _score_par_montos(
@@ -2551,7 +2560,7 @@ def procesar_archivo_interno(ruta_archivo):
         if not imagenes_doc:
             hechos_prev = extraer_hechos_del_texto(texto_analizar)
             if _es_placeholder(hechos_prev.get("marca")) or _es_placeholder(hechos_prev.get("modelo")):
-                print("[INFO] Sin marca/modelo etiquetados. Rasterizando para MiniCPM-V...")
+                print("[INFO] Sin marca/modelo etiquetados. Rasterizando para visión...")
                 idxs = list(doc["paginas"][:2])
                 if es_pdf:
                     imagenes_por_idx.update(rasterizar_paginas(ruta_archivo, idxs))

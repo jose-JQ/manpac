@@ -32,7 +32,7 @@ if %errorlevel%==0 (
 
 echo.
 echo Listo. Ahora instala los programas externos (ver README.md):
-echo   1. Ollama  +  ollama pull qwen2.5:3b  +  ollama pull minicpm-v
+echo   1. Ollama 0.7+  +  ollama pull qwen2.5:3b  +  ollama pull qwen2.5vl:3b
 echo   2. Tesseract OCR
 echo   3. Poppler
 echo Luego ejecuta iniciar.bat

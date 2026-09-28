@@ -165,7 +165,9 @@ _RE_ACCESORIO_CTX = re.compile(
     r"gesti[oó]n\s+de\s+matricul)\b"
 )
 _RE_FICHA_SPEC = re.compile(
-    r"(?i)\b(?:bater[ií]a|autonom[ií]a|potencia|tracci[oó]n|motor(?:izaci[oó]n)?(?:\s+el[eé]ctrico)?)\s*[:\d]"
+    r"(?i)^(?:bater[ií]a|autonom[ií]a|potencia|tracci[oó]n|aceleraci[oó]n|"
+    r"motor\s+el[eé]ctrico|capacidad\s+bater)\b"
+    r"|\b(?:bater[ií]a|autonom[ií]a|potencia|tracci[oó]n)\s*[:\d&/]"
 )
 _RE_CLAUSULA_NO_VEH = re.compile(
     r"(?i)\b(?:tiempo\s+de\s+entrega|d[ií]as(?:\s+h[aá]biles)?|disponibilidad|"
@@ -179,7 +181,12 @@ _RE_MARCA_RUIDO = re.compile(
     r"detalle|condiciones?|garant[ií]a|vigencia|validez|proforma|factura|"
     r"dossier|descripci[oó]n|entrega|referencial|disponibilidad|tipo|"
     r"configuraci[oó]n|par[aá]metro|especificaci[oó]n|rendimiento|"
-    r"adquisici[oó]n|cliente|cantidad|valor|total)$"
+    r"adquisici[oó]n|cliente|cantidad|valor|total|potencia|torque|"
+    r"otencia|autonom[ií]a|bater[ií]a|capacidad)$"
+)
+_RE_SPEC_NO_VEH = re.compile(
+    r"(?i)\b(?:p?otencia|torque|autonom[ií]a|bater[ií]a|wltp|kwh|"
+    r"capacidad\s+bater|nm\b|hp\b)\b|^\s*/"
 )
 _PALABRAS_NO_MARCA = {
     "tipo", "marca", "modelo", "color", "año", "ano", "year", "cliente", "item",
@@ -260,14 +267,43 @@ def _es_placeholder(val):
     return (not s_norm) or s_norm in PLACEHOLDERS
 
 
+def _plantilla_vacia(texto):
+    """Formulario sin llenar: muchos guiones y ningún monto real."""
+    t = texto or ""
+    if len(re.findall(r"_{4,}", t)) < 4:
+        return False
+    return not bool(re.search(r"(?i)(?:\$|usd)\s*\d", t))
+
+
+def _texto_es_relleno_visual(val):
+    s = str(val or "").strip()
+    if not s:
+        return True
+    if s.count("_") >= 4 or re.fullmatch(r"[\s_—.|\-/]+", s):
+        return True
+    return False
+
+
+def _par_vehiculo_util(marca, modelo):
+    if not _marca_comercial_ok(marca):
+        return False
+    if not modelo or _es_placeholder(modelo) or _texto_es_relleno_visual(modelo):
+        return False
+    if _RE_SPEC_NO_VEH.search(f"{marca} {modelo}"):
+        return False
+    return True
+
+
 def _marca_comercial_ok(marca):
-    if not marca or _es_placeholder(marca) or _es_relleno(marca):
+    if not marca or _es_placeholder(marca) or _es_relleno(marca) or _texto_es_relleno_visual(marca):
+        return False
+    if "," in str(marca):
         return False
     s = str(marca).strip(" .;,-/")
     low = s.lower()
     if low in COLORES_NO_MARCA or low in _PALABRAS_NO_MARCA:
         return False
-    if _RE_MARCA_RUIDO.match(s) or _RE_CLAUSULA_NO_VEH.search(s):
+    if "," in s or _RE_MARCA_RUIDO.match(s) or _RE_CLAUSULA_NO_VEH.search(s) or _RE_SPEC_NO_VEH.search(s):
         return False
     if len(s) < 2 or len(s) > 32:
         return False
@@ -1145,7 +1181,15 @@ def _titulo_vehiculo_ok(tit):
     t = _limpiar_titulo_producto(tit)
     if not t or len(t) < 4:
         return False
-    if _RE_CLAUSULA_NO_VEH.search(t):
+    if _RE_CLAUSULA_NO_VEH.search(t) or _RE_SPEC_NO_VEH.search(t):
+        return False
+    if re.search(
+        r"(?i)\b(?:garant[ií]as?|condiciones\s+comerciales|precio\s+final|"
+        r"impuestos|pol[ií]ticas\s+de|subtotal|liquidaci[oó]n|"
+        r"emisiones|costo\s+operativo|dual\s+motor|ahorro\s+operacional|"
+        r"modular\s+scalable)\b",
+        t,
+    ):
         return False
     if re.match(
         r"(?i)^(dm-?i|ev|suv|awd|4x[24]|a[nñ]o|year|edici[oó]n|color|"
@@ -1336,7 +1380,22 @@ def extraer_hechos_del_texto(texto):
                 modelo = " ".join(partes[1:])
         elif combo and not _marca_comercial_ok(marca):
             marca = combo
-    if _es_placeholder(marca) and modelo:
+    m_bloque = re.search(
+        r"(?i)modelo\s*(?:&|y)\s*a[nñ]o\s*\n+\s*([^\n]{3,80})",
+        t,
+    )
+    m_veh = re.search(
+        r"(?i)(?:veh[ií]culo|configuraci[oó]n|ficha\s+comercial)\s*:\s*([^\n]{4,90})",
+        t,
+    )
+    if m_veh and not m_bloque:
+        m_bloque = m_veh
+    if m_bloque and not _par_vehiculo_util(marca, modelo):
+        linea = _limpiar_titulo_producto(m_bloque.group(1))
+        pm, pmod = _partir_nombre_comercial(linea) if linea else (None, None)
+        if _marca_comercial_ok(pm):
+            marca, modelo = pm, pmod or modelo
+    if _es_placeholder(marca) and modelo and not _texto_es_relleno_visual(modelo):
         pm, pmod = _partir_nombre_comercial(modelo)
         if _marca_comercial_ok(pm):
             marca = pm
@@ -1354,6 +1413,8 @@ def extraer_hechos_del_texto(texto):
             and not _es_placeholder(modelo)
             and modelo.lower() not in _MODELO_GENERICO
             and not _RE_CLAUSULA_NO_VEH.search(modelo)
+            and not _RE_SPEC_NO_VEH.search(modelo)
+            and not _texto_es_relleno_visual(modelo)
             and len(modelo.split()) <= 8
         ):
             hechos["modelo"] = modelo
@@ -1401,6 +1462,9 @@ def extraer_hechos_del_texto(texto):
         r"total\s+documento",
         r"importe\s+total",
         r"total\s+(?:factura|proforma|referencial|cotizaci[oó]n|presupuesto)",
+        r"precio\s+final",
+        r"precio\s+de\s+venta",
+        r"total\s+final",
         r"(?<![a-záéíóúñ])total\s*:",
     )
     candidatos_total = []
@@ -1482,6 +1546,11 @@ def extraer_hechos_del_texto(texto):
         total = recon
     if total > 0 and not _monto_parece_vehiculo(total):
         total = 0.0
+    venta = _monto_tras_etiqueta(t, (r"precio\s+de\s+venta",), tomar="ultimo")
+    if _monto_parece_vehiculo(venta) and venta > total:
+        total = venta
+    if total > 0 and 0 < neto < total * 0.45 and _monto_parece_vehiculo(total):
+        neto = total
     if (
         neto_etiqueta > 0
         and total > 0
@@ -1559,8 +1628,8 @@ def aplicar_hechos(datos, hechos):
     if hechos.get("marca") or hechos.get("modelo"):
         hm, hmod = hechos.get("marca"), hechos.get("modelo")
         om, omod = out.get("marca"), out.get("modelo")
-        hechos_ok = not _es_placeholder(hm) and not _es_placeholder(hmod)
-        out_ok = not _es_placeholder(om) and not _es_placeholder(omod)
+        hechos_ok = _par_vehiculo_util(hm, hmod)
+        out_ok = _par_vehiculo_util(om, omod)
         if hechos_ok and not out_ok:
             out["marca"], out["modelo"] = hm, hmod
         elif hechos_ok:
@@ -1570,9 +1639,9 @@ def aplicar_hechos(datos, hechos):
                 out["marca"], out["modelo"] = hm, hmod
             elif not hit_o[0]:
                 out["marca"], out["modelo"] = hm, hmod
-        elif _es_placeholder(om) and not _es_placeholder(hm):
+        elif _es_placeholder(om) and _marca_comercial_ok(hm):
             out["marca"] = hm
-        elif _es_placeholder(omod) and not _es_placeholder(hmod):
+        elif _es_placeholder(omod) and hmod and not _texto_es_relleno_visual(hmod) and not _RE_SPEC_NO_VEH.search(str(hmod)):
             out["modelo"] = hmod
     return normalizar_datos_llm(out)
 
@@ -2156,8 +2225,14 @@ _RE_NUM_DOC = r"(?:n[úu]m(?:ero)?|n[°ºo0*\.]|nro\.?|no\.?|#)"
 def extraer_id_documento(texto):
     """Folio / número de documento, no RUT/RUC ni teléfono."""
     t = (texto or "").replace("\u00a0", " ")
-    cab = t[:2500]
+    cab = t[:2200]
+    cab_plana = re.sub(r"\s+", " ", cab)
+    cab_plana = re.sub(r"\s*([-/#])\s*", r"\1", cab_plana)
     patrones = [
+        r"(?i)(?:cotizaci[oó]n|proforma|factura|presupuesto|nota\s+de\s+venta|doc[_\s-]*id)\s*(?:n[°ºo\.]\s*)?[:#]?\s*"
+        r"([A-Z][A-Z0-9]{0,12}(?:[-/][A-Z0-9]{1,12}){1,5})",
+        r"(?i)(?:\bn[°ºo]\.?|\bno\.?|\bnro\.?|#)\s*[:.]?\s*"
+        r"([A-Z][A-Z0-9]{0,12}(?:[-/][A-Z0-9]{1,12}){1,5}|\d{3,6}-\d{4,12})",
         rf"(?i)(?:{_RE_TIPO_DOC})?\s*(?:{_RE_NUM_DOC})[^\nA-Z0-9]{{0,24}}"
         r"([A-Z]{1,8}[-/]\d{2,8}(?:[-/]\d{2,8}){0,3})",
         rf"(?i)(?:{_RE_TIPO_DOC})[\s\S]{{0,60}}?(\d{{3}}-\d{{3}}-\d{{4,9}})",
@@ -2166,17 +2241,21 @@ def extraer_id_documento(texto):
         rf"(?i)(?:{_RE_NUM_DOC})\s*[:.\-]?\s*"
         r"([A-Z]{1,8}[-/]\d{2,8}(?:[-/]\d{2,8}){0,3}|\d{3,6}\s*[-–]\s*\d{5,12}|\d{3,10})",
     ]
-    for patron in patrones:
-        for m in re.finditer(patron, cab):
-            prev = cab[max(0, m.start() - 22): m.start()].lower()
-            if re.search(r"(?:rut|ruc|c\.?\s*i\.?|c[eé]dula|nit|dni|tel|cel|fax)\s*:?\s*$", prev):
-                continue
-            val = re.sub(r"\s+", "", m.group(1).replace("–", "-"))
-            if _id_doc_descartable(val):
-                continue
-            if re.fullmatch(r"\d{4,8}", val) and re.search(r"\d{3,6}-\d{5,}", cab[m.start(): m.end() + 16]):
-                continue
-            return val
+    fuentes = (cab_plana, cab)
+    for fuente in fuentes:
+        for patron in patrones:
+            for m in re.finditer(patron, fuente):
+                prev = fuente[max(0, m.start() - 22): m.start()].lower()
+                if re.search(r"(?:rut|ruc|c\.?\s*i\.?|c[eé]dula|nit|dni|tel|cel|fax)\s*:?\s*$", prev):
+                    continue
+                val = re.sub(r"\s+", "", m.group(1).replace("–", "-"))
+                if re.fullmatch(r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}", val):
+                    continue
+                if _id_doc_descartable(val):
+                    continue
+                if re.fullmatch(r"\d{4,8}", val) and re.search(r"\d{3,6}-\d{5,}", fuente[m.start(): m.end() + 16]):
+                    continue
+                return val
     if re.search(r"(?i)\b(?:vendedor|comprador|emisor|adquir|cliente|proveedor)\b", cab):
         m = re.search(r"\b(\d{3,6}[-–]\d{7,12})\b", cab)
         if m and not _id_doc_descartable(m.group(1)):
@@ -2328,6 +2407,8 @@ def segmentar_documentos_logicos(paginas_data):
         mismo_id = _ids_iguales(id_pagina, id_actual)
         nuevo_id = bool(id_pagina and id_actual and not mismo_id)
         nuevo_tipo = bool(tipo and tipo_actual and tipo != tipo_actual and not es_pag_sig)
+        # "Página 2 de 5" en un compilado no es continuación si la hoja abre otra proforma con otro folio.
+        abre_otro = bool(id_pagina) and not mismo_id and actual is not None
 
         if actual is None:
             actual = _doc_vacio()
@@ -2337,7 +2418,7 @@ def segmentar_documentos_logicos(paginas_data):
             cerrado = documento_parece_cerrado(texto)
             continue
 
-        if mismo_id or (continuacion and not nuevo_id and not nuevo_tipo):
+        if mismo_id or (continuacion and not nuevo_id and not nuevo_tipo and not abre_otro):
             _agregar_pagina(actual, pagina)
             if id_pagina:
                 id_actual = id_pagina
@@ -2346,7 +2427,7 @@ def segmentar_documentos_logicos(paginas_data):
             cerrado = documento_parece_cerrado(actual["texto"])
             continue
 
-        debe_partir = nuevo_id or nuevo_tipo or (portada and not es_pag_sig)
+        debe_partir = nuevo_id or nuevo_tipo or abre_otro or (portada and not es_pag_sig)
         if debe_partir:
             docs.append(actual)
             actual = _doc_vacio()
@@ -2450,6 +2531,9 @@ def extraer_y_validar(texto, imagenes_doc, es_nativo):
             return datos, es_valido, msj
 
     # Visión solo si OCR no trajo identidad o montos. Un fallo de catálogo no se arregla con el VLM.
+    if _plantilla_vacia(texto):
+        print("[INFO] Plantilla en blanco (campos con guiones). No se llama al modelo de visión.")
+        return datos, es_valido, msj
     necesita_vision = falta_id_o_persona or (not es_nativo and montos_mal)
     if not necesita_vision:
         return datos, es_valido, msj

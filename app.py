@@ -18,7 +18,7 @@ ARCHIVO_EXCEL = "reporte_extracciones.xlsx"
 # CONFIGURACIÓN DE PÁGINA
 # ==========================================
 st.set_page_config(
-    page_title="Extractor IA Automotriz",
+    page_title="Extractor Automotriz",
     page_icon=":material/directions_car:",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -32,7 +32,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-header">Sistema de Gestión y Extracción de Facturas</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Motor de IA Centralizado mediante API REST</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header"></div>', unsafe_allow_html=True)
 
 tab_facturas, tab_extracciones, tab_vehiculos = st.tabs([
     ":material/upload_file: Procesamiento por Lotes",

@@ -30,30 +30,31 @@ Un PDF de varias páginas puede contener **varias facturas**. El pipeline las se
 
 ## Arquitectura
 
-Hay tres procesos que trabajan juntos:
+Hay un solo proceso: FastAPI sirve la UI y la API.
 
 ```mermaid
 flowchart LR
-    usuario[Usuario] --> ui[Streamlit<br/>app.py :8501]
-    ui -->|POST multipart + stream NDJSON| api[FastAPI<br/>api_backend.py :8000]
+    usuario[Usuario] --> ui[HTML/CSS/JS<br/>FastAPI 127.0.0.1:8000]
+    ui -->|POST multipart + stream NDJSON| api[FastAPI<br/>api_backend.py]
     api --> pipe[pipeline.py]
-    pipe --> ocr[PyMuPDF o Tesseract + DocTR]
-    ocr --> llm[Qwen 2.5 y Qwen2.5-VL 3B]
+    pipe --> ocr[PyMuPDF o Tesseract]
+    ocr --> llm[Qwen 2.5 y Qwen2.5-VL 3B en localhost]
     llm --> val[Validación fuzzy vs SQLite]
-    val --> out[Excel, log y fragmentos]
+    val --> out[Excel, JSON de corrida y fragmentos]
     val --> ui
 ```
 
 | Archivo | Rol |
 | --- | --- |
-| `app.py` | Interfaz: subir lotes, ver extracciones y administrar marcas/modelos |
-| `api_backend.py` | API REST. Recibe el archivo, llama al pipeline y **transmite** cada factura (`application/x-ndjson`) |
-| `pipeline.py` | Cerebro: OCR, LLMs, validación, Excel y logs |
+| `web/` | Interfaz: HTML, CSS y JS servidos por FastAPI |
+| `api_backend.py` | API REST **y** la UI. Recibe el archivo, llama al pipeline y transmite cada factura (`application/x-ndjson`) |
+| `pipeline.py` | Cerebro: OCR, LLMs, validación y fragmentos PDF |
+| `reportes.py` | Ítems de tabla, Excel reciente/histórico y columna Estado |
 | `base.py` | Esquema ORM de `vehiculos.db` (marca → modelo → especificación técnica) |
 | `vehiculos.db` | Catálogo SQLite con el que se confirma si el vehículo existe |
 | `alimentar_base.ipynb` | Notebook opcional para reconstruir/ampliar el catálogo |
 
-La UI **no** carga los modelos de IA. Solo habla con la API. Por eso hay que tener **los dos** servidores encendidos.
+La UI **no** carga los modelos de IA. El navegador habla con el mismo proceso FastAPI en **127.0.0.1:8000**. Ollama queda en **127.0.0.1:11434** (no se expone a la red).
 
 ---
 
@@ -65,15 +66,14 @@ El flujo es el mismo para facturas, proformas, cotizaciones y notas de venta. El
 flowchart TB
     archivo[PDF o imagen] --> nativo{¿Página nativa?}
     nativo -->|Sí: texto útil, poca foto| pymupdf[PyMuPDF]
-    nativo -->|No: escaneo o imagen| raster[Raster 250 dpi]
-    raster --> tess[Tesseract spa psm 4+6]
-    tess --> doctr{¿Montos o texto pobres?}
-    doctr -->|Sí| doctrOcr[DocTR]
-    doctr -->|No| seg
-    doctrOcr --> seg
+    nativo -->|No: escaneo o imagen| raster[Raster 180 dpi]
+    raster --> tess[Tesseract spa psm 6 y 4]
+    tess --> seg
     pymupdf --> seg[Segmentar documentos lógicos]
     seg --> hechos[Anclas regex: CI, nombre, montos, vehículo]
-    hechos --> qwen[Qwen 2.5 3B → JSON]
+    hechos --> enough{¿Anclas completas?}
+    enough -->|Sí| eval
+    enough -->|No| qwen[Qwen 2.5 3B → JSON]
     qwen --> aplicar[Fusionar anclas + LLM]
     aplicar --> eval{¿Válido?}
     eval -->|Nativo y falta campo| qwen2[Reintento Qwen]
@@ -91,7 +91,7 @@ flowchart TB
 Cada página se clasifica con `es_pagina_nativa`:
 
 - **Nativo:** hay texto útil y la hoja no está cubierta por una foto grande. Se usa solo **PyMuPDF**. No se rasteriza ni se llama al modelo de visión.
-- **No nativo** (escaneo, foto, PDF imagen): raster 250 dpi con Poppler → **Tesseract** (`spa`, OSD para rotación, `psm 6` + `psm 4`, corrección de texto invertido 180°). Si hay menos de dos montos bien formados, entra **DocTR** (`db_resnet50` + `crnn_vgg16_bn`).
+- **No nativo** (escaneo, foto, PDF imagen): raster **180 dpi** con Poppler → **Tesseract** (`spa`, `psm 6` y, si el texto es corto, `psm 4`) en paralelo entre páginas.
 
 Las imágenes sueltas (PNG/JPG) siempre van por la rama de escaneo.
 
@@ -111,7 +111,7 @@ Cada documento lógico se guarda como fragmento PDF en `procesados_exito/` o `re
 1. **Hechos regex** (`extraer_hechos_del_texto`): comprador vs vendedor, CI/RUT/RUC, razón social o nombre, marca/modelo, montos coherentes con IVA 0/12/15/19 % y reconstrucción de ítems si el OCR cambia un dígito.
    - Si **no hay** etiquetas `Marca:` / `Modelo:`, usa la ficha técnica (línea sobre batería/autonomía) o la descripción del ítem más caro. Ignora accesorios (`Smart Wallbox`, cargador, kit, placas).
    - Una marca de catálogo suelta (p. ej. la palabra "Smart" en un accesorio) **no** elige un modelo al azar ni marca ÉXITO.
-2. **Qwen 2.5 3B** (`qwen2.5:3b`) convierte el texto en JSON, con esos hechos como pista.
+2. **Qwen 2.5 3B** (`qwen2.5:3b`) convierte el texto en JSON, con esos hechos como pista. Si las anclas ya traen marca, modelo, comprador, CI y un par de montos válido, **se omite** este pase.
 3. `aplicar_hechos` veta el RUC/RUT del **vendedor** como CI del comprador, elige el mejor par de montos y, si el texto ya trajo un nombre comercial completo, no lo deja pisar por un accesorio.
 
 El comprador puede ser **persona** (cédula 8–10 dígitos) o **empresa** (RUT chileno o RUC ecuatoriano de 13). Se descartan RUC dummy tipo `0999999999001`.
@@ -137,16 +137,17 @@ No hay un tercer modelo “juez”. Llama 3.1 **no** forma parte del flujo.
 
 ### 6. Salida
 
-Cada factura se `yield` a la API (la UI la pinta al momento).
+Cada factura se `yield` a la API (la UI la pinta al momento). El visor abre el fragmento desde esas carpetas; no hay una copia extra del original.
 
-- Éxitos → `procesados_exito/` + `reporte_extracciones.xlsx`.
+- Éxitos → `procesados_exito/` + Excel de la corrida reciente.
 - Fallos → `revision_manual/` + `log_revision_fallos.txt`.
+- La corrida reciente (`reportes_recientes/corrida.json`) es **todo el último lote**. Un lote nuevo la sustituye; cambiar de pestaña no la borra.
 
 ---
 
 ## Requisitos mínimos (con o sin GPU)
 
-El sistema **no exige GPU**. Si hay una NVIDIA (o CUDA en PyTorch), **el código la usa solo**: Ollama con `num_gpu` y DocTR en `cuda`. Sin GPU, el mismo flujo sigue en CPU. La GPU no cambia las reglas de validación.
+El sistema **no exige GPU**. Si hay una NVIDIA, **Ollama usa la GPU** (`num_gpu`). Sin GPU, el mismo flujo sigue en CPU. La GPU no cambia las reglas de validación.
 
 ```mermaid
 flowchart TB
@@ -164,13 +165,13 @@ flowchart TB
 | **Uso diario** | 8 núcleos, 16–32 GB RAM | **8 GB+ VRAM**, 16 GB RAM |
 | **PDF nativo** | Bien | Bien (Qwen en GPU vía Ollama) |
 | **Escaneo / foto** | Tesseract sí. Visión 3B lenta en CPU | Qwen2.5-VL 3B en GPU (~3 GB VRAM) |
-| **Qué hace el código** | CPU automático | `num_gpu=99` en Ollama; DocTR `.to("cuda")` si `torch.cuda` está |
+| **Qué hace el código** | CPU automático | `num_gpu=99` en Ollama; si hay 8 GB+ VRAM no descarga el modelo de texto antes de visión |
 
 **Software común a ambos**
 
 - Windows 10/11 (rutas de Poppler/Tesseract pensadas para Windows)
 - Python **3.11+**
-- Ollama **0.7+** en ejecución + `qwen2.5:3b` (texto) y `qwen2.5vl:3b` (escaneos dudosos)
+- Ollama **0.7+** en ejecución, **solo en 127.0.0.1:11434** + `qwen2.5:3b` (texto) y `qwen2.5vl:3b` (escaneos dudosos)
 - Tesseract con idioma `spa` y Poppler (solo páginas no nativas)
 
 **RAM aproximada en marcha**
@@ -179,16 +180,26 @@ flowchart TB
 | --- | --- | --- |
 | Qwen 2.5 3B (Ollama) | ~2–4 GB RAM | ~2–3 GB VRAM |
 | Qwen2.5-VL 3B (Ollama) | ~4 GB RAM, usable | ~3 GB VRAM |
-| DocTR (PyTorch) | 1–2 GB RAM extra, lento | CUDA si el `torch` es CUDA |
-| Streamlit + FastAPI + SQLite | ~0.5 GB | igual |
+| FastAPI + SQLite | ~0.5 GB | igual |
+
+### Escenarios de cómputo
+
+| Escenario | CPU | RAM | Disco | GPU | Qué corre y a qué ritmo |
+| --- | --- | --- | --- | --- | --- |
+| **1. CPU mínimo** | 4 núcleos | 16 GB | 15 GB | No | PDF nativo con Qwen 2.5 3B. Un documento a la vez. Un escaneo con visión puede tardar varios minutos. |
+| **2. CPU recomendado** | 8 núcleos | 32 GB | SSD NVMe | No | Lotes de PDF nativos. Tesseract en paralelo. Visión 3B sigue siendo lenta. |
+| **3. GPU mínimo** | 4 núcleos | 16 GB | 20 GB | NVIDIA 4–6 GB VRAM | Qwen texto y `qwen2.5vl:3b`. El pipeline descarga texto antes de visión. |
+| **4. GPU recomendado** | 8 núcleos | 32 GB | SSD NVMe | 8–16 GB VRAM | Texto y visión en GPU. Escaneos en segundos una vez cargado el VL 3B. |
+
+Oracle (`DB_USER`, `DB_PASS`, `DB_HOST`, `DB_PORT`, `DB_SERVICE`) solo hace falta para **Aceptar reporte**. Sin `.env` el catálogo local SQLite sigue validando modelos. Copia `.env.example` a `.env`.
 
 En **8 GB de RAM sin GPU** se pueden procesar PDF nativos cortos. AMD/Intel GPU en Windows: Ollama suele ir a CPU.
 
 Si no hay GPU, no hace falta `qwen2.5vl:3b` para el camino nativo. Un escaneo difícil irá a **REVISIÓN** con Tesseract + Qwen texto, o visión en CPU (lento). MiniCPM-V (~8B) se sustituyó porque era demasiado pesado; para volver a él: `set OLLAMA_VISION=minicpm-v`.
 
-`instalar.bat` deja `torch` CPU y, si encuentra `nvidia-smi`, intenta reinstalar PyTorch CUDA (`cu124`) para que DocTR también use la GPU. Ollama **no** usa ese `torch`; tiene su propio runtime y el pipeline le pide GPU cuando hay NVIDIA. Forzar CPU: `set OLLAMA_NUM_GPU=0`.
+Ollama **no** comparte proceso con Python: tiene su propio runtime. Forzar CPU: `set OLLAMA_NUM_GPU=0`.
 
-Si la rueda CUDA no existe para tu Python, DocTR se queda en CPU y Ollama igual puede usar la GPU.
+**Puerto de Ollama:** debe ser `http://127.0.0.1:11434`. En la app de Ollama para Windows desactiva *Expose Ollama to the network*. Si el servicio ya escuchaba en `0.0.0.0:11434`, pon `OLLAMA_HOST=127.0.0.1:11434` en las variables de usuario y reinicia Ollama. El cliente de ManPAC rechaza un host que no sea loopback (salvo `MANPAC_ALLOW_REMOTE_OLLAMA=1`). `iniciar.bat` fuerza el cliente a localhost y avisa si `11434` está abierto a la red.
 
 ---
 
@@ -200,17 +211,15 @@ Ver `requirements.txt`. Las librerías y para qué sirven:
 
 | Librería | Uso |
 | --- | --- |
-| `streamlit` | Interfaz web local |
-| `fastapi` + `uvicorn` + `python-multipart` | API y carga de archivos |
-| `requests` | Cliente HTTP de la UI hacia la API |
+| `fastapi` + `uvicorn` + `python-multipart` | API, UI web y carga de archivos |
 | `SQLAlchemy` | ORM y consultas a `vehiculos.db` |
 | `pandas` + `openpyxl` | Excel de extracciones |
 | `pymupdf` | Texto nativo de PDF y recorte de fragmentos |
 | `pdf2image` | PDF → imágenes (requiere Poppler) |
 | `pytesseract` | OCR clásico (requiere Tesseract `spa`) |
-| `python-doctr` + `torch` | OCR neuronal para escaneos difíciles |
-| `opencv-python` + `numpy` + `pillow` | Imágenes (DocTR / PIL) |
-| `ollama` | Cliente de los modelos locales |
+| `pillow` | Imágenes para OCR y visión |
+| `ollama` | Cliente de los modelos locales (solo localhost) |
+| `oracledb` + `python-dotenv` | Oracle opcional y `.env` |
 
 Instalación rápida:
 
@@ -224,8 +233,6 @@ O a mano:
 python -m venv venv
 venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
-
-La primera vez que DocTR corre, **descarga pesos** (hace falta internet).
 
 ### 2. Programas externos (no van por pip)
 
@@ -256,16 +263,15 @@ set TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe
 
 ## Cómo arrancar
 
-1. Deja **Ollama** en ejecución (`qwen2.5:3b`; `qwen2.5vl:3b` si vas a mandar escaneos).
-2. Ejecuta `iniciar.bat` (abre API + UI).
-3. Abre http://localhost:8501
-4. En **Procesamiento por Lotes**, sube PDF/PNG/JPG y pulsa *Enviar al Servidor IA*.
+1. Deja **Ollama** en ejecución en **127.0.0.1:11434** (`qwen2.5:3b`; `qwen2.5vl:3b` si vas a mandar escaneos). Sin exponer el puerto a la red.
+2. Ejecuta `iniciar.bat` (abre un solo servidor FastAPI con la interfaz).
+3. Abre http://127.0.0.1:8000
+4. En **Procesar**, sube PDF/PNG/JPG y pulsa *Procesar lote*. La tabla de **Corrida reciente** conserva **todos** los documentos de ese lote al cambiar de pestaña.
 
-A mano, en dos terminales:
+A mano:
 
 ```bat
 venv\Scripts\python.exe api_backend.py
-venv\Scripts\streamlit.exe run app.py
 ```
 
 Comprobación: http://127.0.0.1:8000/api/health
@@ -274,9 +280,11 @@ Comprobación: http://127.0.0.1:8000/api/health
 
 ## Uso de la interfaz
 
-1. **Procesamiento por Lotes** — sube uno o varios documentos. Cada factura aparece en un expander (verde = éxito, naranja = revisión).
-2. **Reporte de Extracciones** — tabla del Excel consolidado y botón de descarga.
-3. **Base de Datos de Vehículos** — alta/edición/baja de marcas y modelos. Si un vehículo no está en el catálogo, las facturas reales irán a revisión aunque la IA lea bien el papel.
+1. **Procesar** — sube uno o varios documentos. Cada factura entra a una tabla (badge verde = EXITO, ámbar = REVISION).
+2. **Reportes** — corrida reciente e histórico, celdas editables, visor del PDF, descarga Excel y *Aceptar en Oracle*.
+3. **Vehículos** — alta/edición/baja de marcas y modelos. Si un vehículo no está en el catálogo, las facturas reales irán a revisión aunque la IA lea bien el papel.
+
+No se muestran requisitos de GPU en la interfaz; eso va solo en este README.
 
 ---
 
@@ -284,8 +292,17 @@ Comprobación: http://127.0.0.1:8000/api/health
 
 | Método | Ruta | Descripción |
 | --- | --- | --- |
-| `GET` | `/api/health` | Estado del servidor |
+| `GET` | `/` | Interfaz web |
+| `GET` | `/api/health` | Estado del servidor y aviso si Ollama está expuesto |
 | `POST` | `/api/procesar-factura` | `multipart/form-data` campo `file`. Respuesta NDJSON (una línea JSON por factura) |
+| `GET` | `/api/documento` | Visor del fragmento en `procesados_exito/` o `revision_manual/` |
+| `POST` | `/api/corrida/iniciar` | Vacía la corrida reciente (solo al empezar un lote) |
+| `POST` | `/api/corrida/finalizar` | Descarga los modelos de Ollama al terminar el lote |
+| `GET`/`PUT` | `/api/corrida` | Corrida reciente (JSON) |
+| `GET` | `/api/corrida/excel` | Excel de éxitos o revisión (`?tipo=exitos\|revision`) |
+| `POST` | `/api/corrida/aceptar` | Carga el reporte editado a Oracle |
+| `GET` | `/api/historico` | Histórico de ejecuciones |
+| `GET`/`POST`/`PUT`/`DELETE` | `/api/catalogo/...` | Marcas y modelos |
 
 ---
 
@@ -295,8 +312,10 @@ Este paquete **no incluye** facturas de clientes, logs ni el `venv` (pesan y pue
 
 ```
 pipeline.py
-app.py
+web/
 api_backend.py
+reportes.py
+oracle_db.py
 base.py
 vehiculos.db
 requirements.txt
@@ -306,7 +325,7 @@ README.md
 alimentar_base.ipynb   (opcional, para regenerar el catálogo)
 ```
 
-Carpetas que se crean solas al procesar: `temp_api_uploads/`, `procesados_exito/`, `revision_manual/`.
+Carpetas que se crean solas al procesar: `temp_api_uploads/` (temporal), `procesados_exito/`, `revision_manual/`, `reportes_recientes/`.
 
 ---
 
@@ -320,7 +339,7 @@ Esto es un extractor **local, híbrido (regex + LLM pequeño + catálogo)**, no 
 4. **LLM pequeño (Qwen 3B).** Rellena JSON; las anclas regex tienen prioridad. Puede alucinar campos si el texto es pobre. No sustituye un modelo documental grande ni facturación electrónica (XML SRI/SII).
 5. **Identidad y montos son heurísticos.** Distingue emisor vs comprador, RUT/RUC/cédula, CLP vs USD e IVA 0/12/15/19 %, pero no valida dígito verificador chileno ni módulo 10 ecuatoriano de forma fiscal. Un total mal OCR-eado puede pasar el umbral de “parece precio”.
 6. **Un proceso a la vez.** Lotes en serie. El VLM mira como máximo 2 páginas del documento lógico.
-7. **Windows + local.** Poppler/Tesseract con rutas típicas de Windows. No hay cola, auth ni multi-usuario. Primer arranque de DocTR descarga pesos (hace falta red).
+7. **Windows + local.** Poppler/Tesseract con rutas típicas de Windows. API y Ollama en loopback. No hay cola, auth ni multi-usuario.
 8. **ÉXITO / REVISIÓN es binario.** No hay score de confianza por campo ni corrección humana que retroalimente el modelo.
 
 Documentos de prueba (solo ejemplos, no plantillas): https://drive.google.com/file/d/1XIW_EGftxosJTgwKd1E8OlDa-6Of030a/view?usp=sharing
@@ -351,10 +370,10 @@ No subir el fuzzy “hasta que el ejemplo pase”: GET N230 no debe convertirse 
 | --- | --- | --- |
 | 1 | **No rasterizar ni llamar visión en PDF nativo** (ya es el diseño) | Ahorra Poppler, Tesseract y el VLM. |
 | 2 | **GPU para Ollama** si el lote trae escaneos | El VL 3B en CPU es lento; en nativos Qwen texto en CPU basta. |
-| 3 | **DocTR perezoso y condicional** (ya se carga al primer escaneo flojo) | No pagar PyTorch en un lote 100 % nativo. |
+| 3 | **No instalar PyTorch/DocTR** | El OCR vivo es Tesseract; no paga VRAM extra. |
 | 4 | **Un solo reintento de visión; abortar si Ollama no responde** | Evita esperas dobles cuando el servicio está caído. |
-| 5 | **Bajar DPI de raster** (p. ej. 180) si la letra es clara | Menos píxeles = Tesseract y visión más rápidos. |
-| 6 | **`keep_alive` de Ollama** y no mezclar VL + Qwen texto si la VRAM es justa | El pipeline descarga el de texto antes de cargar visión. |
-| 7 | **Paralelizar documentos, no páginas a ciegas** | Un worker por archivo con lock en Excel. SQLite del catálogo es de lectura y ya va en memoria. |
+| 5 | **Raster 180 dpi** | Menos píxeles = Tesseract y visión más rápidos. |
+| 6 | **`keep_alive` de Ollama**; no descargar texto antes de VL si hay 8 GB+ VRAM; al terminar el lote `keep_alive=0` | Menos thrashing. |
+| 7 | **Tesseract en paralelo entre páginas** de un mismo PDF | Un chat Ollama a la vez (la GPU no se pelea). |
 
 Regla corta: **catálogo completo + PDF nativo + anclas** da precisión. **GPU + visión** solo recupera escaneos. Los JSON de prueba sirven para regresión, no para enseñarle al sistema un único formato.

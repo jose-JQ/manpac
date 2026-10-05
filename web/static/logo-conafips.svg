@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 280 64" role="img" aria-label="CONAFIPS">
+  <text x="8" y="38" font-family="Segoe UI, Arial, sans-serif" font-size="32" font-weight="700" letter-spacing="1">
+    <tspan fill="#1A1A1A">C</tspan>
+    <tspan fill="#2BB3B1">O</tspan>
+    <tspan fill="#1A1A1A">N</tspan>
+    <tspan fill="#5B3A8C">A</tspan>
+    <tspan fill="#1A1A1A">F</tspan>
+    <tspan fill="#E8B931">I</tspan>
+    <tspan fill="#1A1A1A">PS</tspan>
+  </text>
+  <path d="M248 14c6 8 6 16 0 24-8-4-12-12-12-24 8 2 12 8 12 0z" fill="#2D6B2F"/>
+  <text x="8" y="56" font-family="Segoe UI, Arial, sans-serif" font-size="9" fill="#2D6B2F" letter-spacing="1.6">BANCA DE DESARROLLO</text>
+</svg>

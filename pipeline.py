@@ -5,20 +5,24 @@ import shutil
 import subprocess
 import time
 import unicodedata
-import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import BytesIO
+from urllib.parse import urlparse
+
 import pymupdf
 from pdf2image import convert_from_path
 import pytesseract
 import ollama
-from io import BytesIO
 import base64
-from PIL import Image
-import pandas as pd
+from PIL import Image, ImageOps
 import difflib
+from dotenv import load_dotenv
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from base import engine, Marca, Modelo
+
+load_dotenv()
 
 # ==========================================
 # 1. CONFIGURACIÓN E INFRAESTRUCTURA
@@ -33,16 +37,16 @@ MODELO_VISION = os.environ.get("OLLAMA_VISION", "qwen2.5vl:3b")
 
 CARPETA_REVISION = "revision_manual"
 CARPETA_EXITOSOS = "procesados_exito"
-ARCHIVO_EXCEL = "reporte_extracciones.xlsx"
 ARCHIVO_LOG = "log_revision_fallos.txt"
+_CATEGORIAS_VEHICULO = ("Coche", "Scooter", "Moto", "Bus", "Van", "Camión")
 
 os.makedirs(CARPETA_REVISION, exist_ok=True)
 os.makedirs(CARPETA_EXITOSOS, exist_ok=True)
 
-modelo_doctr = None
 _catalogo_vehiculos = None
 _aceleracion_impresa = False
 _gpu_cache = {}
+_cliente_ollama = None
 
 
 def _nvidia_presente():
@@ -61,30 +65,115 @@ def _nvidia_presente():
     return ok
 
 
-def dispositivo_torch():
-    """cuda/mps si PyTorch puede usarla; si no, cpu. Se cachea; no se llama en el camino de Ollama."""
-    if "torch" in _gpu_cache:
-        return _gpu_cache["torch"]
-    dev = "cpu"
-    try:
-        import torch
-        if torch.cuda.is_available():
-            dev = "cuda"
-        else:
-            mps = getattr(torch.backends, "mps", None)
-            if mps is not None and mps.is_available():
-                dev = "mps"
-    except Exception:
-        dev = "cpu"
-    _gpu_cache["torch"] = dev
-    return dev
-
-
 def usar_gpu_ollama():
     """Ollama tiene runtime propio. No inicializar torch aquí: el contexto CUDA le resta VRAM."""
     if os.environ.get("OLLAMA_NUM_GPU", "").strip() == "0":
         return False
     return _nvidia_presente()
+
+
+def _vram_total_mb():
+    if "vram" in _gpu_cache:
+        return _gpu_cache["vram"]
+    mb = 0
+    exe = shutil.which("nvidia-smi")
+    if exe:
+        try:
+            r = subprocess.run(
+                [exe, "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            for line in (r.stdout or "").splitlines():
+                token = (line.strip().split() or [""])[0]
+                try:
+                    mb = max(mb, int(float(token)))
+                except ValueError:
+                    pass
+        except Exception:
+            mb = 0
+    _gpu_cache["vram"] = mb
+    return mb
+
+
+def _vram_cabe_ambos():
+    return _vram_total_mb() >= 8192
+
+
+def host_ollama():
+    raw = (os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").strip()
+    raw = raw or "http://127.0.0.1:11434"
+    if "://" not in raw:
+        raw = "http://" + raw
+    return raw
+
+
+def ollama_es_loopback(url=None):
+    try:
+        host = (urlparse(url or host_ollama()).hostname or "").lower()
+    except Exception:
+        return False
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def ollama_remoto_permitido():
+    return os.environ.get("MANPAC_ALLOW_REMOTE_OLLAMA", "").strip().lower() in ("1", "true", "yes")
+
+
+def _puerto_ollama_expuesto():
+    now = time.time()
+    if _gpu_cache.get("exp_ts") and now - _gpu_cache["exp_ts"] < 30:
+        return bool(_gpu_cache.get("exp"))
+    expuesto = False
+    try:
+        r = subprocess.run(["netstat", "-an"], capture_output=True, text=True, timeout=8)
+        out = ((r.stdout or "") + (r.stderr or "")).lower()
+        for line in out.splitlines():
+            if ":11434" not in line:
+                continue
+            if "listen" not in line and "escucha" not in line:
+                continue
+            if "0.0.0.0:11434" in line or "[::]:11434" in line:
+                expuesto = True
+                break
+    except Exception:
+        expuesto = False
+    _gpu_cache["exp"] = expuesto
+    _gpu_cache["exp_ts"] = now
+    return expuesto
+
+
+def estado_ollama():
+    url = host_ollama()
+    expuesto = _puerto_ollama_expuesto()
+    aviso = ""
+    if not ollama_es_loopback(url) and not ollama_remoto_permitido():
+        aviso = f"OLLAMA_HOST={url} no es localhost. Usa http://127.0.0.1:11434."
+    elif expuesto:
+        aviso = (
+            "Ollama escucha en 0.0.0.0:11434. En Windows desactiva "
+            "'Expose Ollama to the network' y reinicia el servicio."
+        )
+    return {
+        "ollama_host": url,
+        "ollama_loopback": ollama_es_loopback(url),
+        "ollama_puerto_expuesto": expuesto,
+        "aviso": aviso,
+    }
+
+
+def _cliente_ollama_get():
+    global _cliente_ollama
+    if _cliente_ollama is None:
+        url = host_ollama()
+        if not ollama_es_loopback(url) and not ollama_remoto_permitido():
+            raise RuntimeError(
+                f"Ollama debe estar en localhost. OLLAMA_HOST={url} no es loopback. "
+                "Usa http://127.0.0.1:11434 o MANPAC_ALLOW_REMOTE_OLLAMA=1."
+            )
+        _cliente_ollama = ollama.Client(host=url, timeout=180)
+    return _cliente_ollama
 
 
 def opciones_ollama(temperature=0.0, **extra):
@@ -100,15 +189,13 @@ def opciones_ollama(temperature=0.0, **extra):
 
 
 def _chat_ollama(timeout, **kwargs):
-    cliente = ollama.Client(timeout=timeout)
-    return cliente.chat(**kwargs)
+    return _cliente_ollama_get().chat(**kwargs)
 
 
 def _liberar_modelo_ollama(modelo):
-    """Saca el LLM de texto de VRAM para que el modelo de visión quepa en la GPU."""
     try:
         print(f"[INFO] Liberando {modelo} de la GPU...")
-        ollama.Client(timeout=20).chat(
+        _cliente_ollama_get().chat(
             model=modelo,
             messages=[{"role": "user", "content": "."}],
             keep_alive=0,
@@ -118,18 +205,17 @@ def _liberar_modelo_ollama(modelo):
         pass
 
 
-def preparar_gpu_para_ollama():
-    """Ollama usa la GPU en su propio proceso. No tocar CUDA desde PyTorch: en Windows se cuelga."""
-    return
+def liberar_modelos_ollama():
+    for modelo in (MODELO_TEXTO, MODELO_VISION):
+        _liberar_modelo_ollama(modelo)
 
 
 def _log_aceleracion(contexto=""):
     global _aceleracion_impresa
     ol = "GPU" if usar_gpu_ollama() else "CPU"
-    msg = (
-        f"[INFO] Aceleración{(' ' + contexto) if contexto else ''}: "
-        f"Ollama={ol} | DocTR=CPU (no comparte CUDA)"
-    )
+    vram = _vram_total_mb()
+    extra = f" | VRAM={vram} MB" if vram else ""
+    msg = f"[INFO] Aceleración{(' ' + contexto) if contexto else ''}: Ollama={ol}{extra}"
     if not _aceleracion_impresa or contexto:
         print(msg)
     _aceleracion_impresa = True
@@ -162,7 +248,15 @@ _RE_ACCESORIO_CTX = re.compile(
     r"flete|env[ií]o|instalaci[oó]n|matricul(?:aci[oó]n)?|soat|"
     r"seguro(?:s)?(?:\s+obligatorio)?|placas?(?:\s+el[eé]ctric|\s+patente)?|"
     r"kit\s+(?:de\s+)?(?:emergencia|matricul|carga)|mantenimiento|"
-    r"gesti[oó]n\s+de\s+matricul)\b"
+    r"gesti[oó]n\s+de\s+matricul|incentivos?\s+fiscal|exoneraci[oó]n|"
+    r"color\s+exterior|homologaci[oó]n|base\s+imponible|"
+    r"tratamiento\s+impositivo|infraestructura\s+de\s+recarga|"
+    r"gravamen|\bOVA\b|mantenimientos?\s+preventivos)\b"
+)
+_RE_NOTA_FISCAL_CTX = re.compile(
+    r"(?i)(?:base\s+imponible|tratamiento\s+impositivo|\bOVA\b|"
+    r"infraestructura\s+de\s+recarga|gravamen|"
+    r"mantenimientos?\s+preventivos|homologaci[oó]n\s+y\s+placas)"
 )
 _RE_FICHA_SPEC = re.compile(
     r"(?i)^(?:bater[ií]a|autonom[ií]a|potencia|tracci[oó]n|aceleraci[oó]n|"
@@ -182,7 +276,9 @@ _RE_MARCA_RUIDO = re.compile(
     r"dossier|descripci[oó]n|entrega|referencial|disponibilidad|tipo|"
     r"configuraci[oó]n|par[aá]metro|especificaci[oó]n|rendimiento|"
     r"adquisici[oó]n|cliente|cantidad|valor|total|potencia|torque|"
-    r"otencia|autonom[ií]a|bater[ií]a|capacidad)$"
+    r"otencia|autonom[ií]a|bater[ií]a|capacidad|datos|d[oó]lares|"
+    r"transferencia|moneda|modalidad|cr[eé]dito|automotriz|"
+    r"financiamiento|leasing|banco|pago)$"
 )
 _RE_SPEC_NO_VEH = re.compile(
     r"(?i)\b(?:p?otencia|torque|autonom[ií]a|bater[ií]a|wltp|kwh|"
@@ -192,13 +288,15 @@ _PALABRAS_NO_MARCA = {
     "tipo", "marca", "modelo", "color", "año", "ano", "year", "cliente", "item",
     "valor", "total", "cantidad", "detalle", "descripcion", "descripción",
     "vehiculo", "vehículo", "electrico", "eléctrico", "suv", "auto", "camion",
-    "camión", "originales", "accesorios", "servicios", "paquete", "tiempo",
+    "camión", "carro", "originales", "accesorios", "servicios", "paquete", "tiempo",
     "entrega", "configuracion", "configuración", "parametro", "parámetro",
     "especificacion", "especificación", "rendimiento", "integral", "motores",
     "adquisicion", "adquisición", "cotizacion", "cotización", "proforma",
     "factura", "dossier", "del", "de", "el", "la", "los", "las", "un", "una",
     "al", "para", "con", "por", "en", "y", "o", "su", "sus", "compacto",
-    "puertas", "referencial", "insignia",
+    "puertas", "referencial", "insignia", "datos", "dolares", "dólares",
+    "transferencia", "moneda", "modalidad", "credito", "crédito",
+    "automotriz", "financiamiento", "leasing", "banco", "pago", "forma",
 }
 _TITULO_STOP = _PALABRAS_NO_MARCA | {
     "garantia", "garantía", "vigencia", "validez", "condiciones", "incluye",
@@ -230,22 +328,6 @@ SUFIJOS_TECNICOS = {
 }
 
 CAMPOS_EXTRACCION = ("marca", "modelo", "cantidad", "beneficiario", "ci", "costo_mas_alto", "costo_total")
-
-
-def get_modelo_doctr():
-    """Siempre CPU. Compartir la GPU con Ollama bloquea el proceso en Windows."""
-    global modelo_doctr
-    if modelo_doctr is None:
-        print("Cargando DocTR en CPU (la GPU queda para Ollama)...")
-        from doctr.models import ocr_predictor
-        modelo_doctr = ocr_predictor(det_arch='db_resnet50', reco_arch='crnn_vgg16_bn', pretrained=True)
-        try:
-            if hasattr(modelo_doctr, "to"):
-                modelo_doctr = modelo_doctr.to("cpu")
-        except Exception:
-            pass
-        _log_aceleracion("DocTR")
-    return modelo_doctr
 
 
 def get_catalogo_vehiculos():
@@ -309,6 +391,11 @@ def _marca_comercial_ok(marca):
         return False
     if re.fullmatch(r"\d+", s):
         return False
+    if re.search(r"[A-Za-zÁÉÍÓÚÑáéíóúñ]", s) and re.search(r"\d", s):
+        cat = {_norm_ocr(m) for m, _ in get_catalogo_vehiculos()}
+        return _norm_ocr(s) in cat
+    if re.match(r"(?i)^ev[\-_]", s):
+        return False
     if len(s) <= 2:
         cat = {_norm_ocr(m) for m, _ in get_catalogo_vehiculos()}
         return _norm_ocr(s) in cat
@@ -328,6 +415,14 @@ def _tokens_vehiculo(texto):
         if re.fullmatch(r"\d+%", t):
             continue
         tokens.append(t)
+        bits = re.findall(r"[A-ZÁÉÍÓÚÑ]+|\d+", t)
+        if len(bits) >= 2:
+            for b in bits:
+                if b in SUFIJOS_TECNICOS or b in tokens:
+                    continue
+                if re.fullmatch(r"\d+P", b) or re.fullmatch(r"\d+KW", b):
+                    continue
+                tokens.append(b)
     if len(tokens) >= 2 and tokens[0] in {"E", "EV"}:
         tokens = tokens[1:]
     return tokens
@@ -344,6 +439,46 @@ def _similitud_nombres(tokens_a, tokens_b):
     if shorter and shorter.issubset(longer):
         return 0.90 + 0.10 * (len(shorter) / max(len(longer), 1))
     return difflib.SequenceMatcher(None, sa, sb).ratio()
+
+
+_GENERIC_MODEL_TOKENS = {
+    "PLUS", "EV", "BEV", "PHEV", "GS", "GL", "LT", "LX", "EX", "SE", "LE",
+    "HATCHBACK", "SEDAN", "SEDÁN", "SUV", "SPORTBACK", "COUPE", "COUPÉ",
+    "CITY", "CAR", "CARGO", "STANDARD", "RANGE", "LONG", "RWD", "AWD", "FWD",
+    "LUXURY", "AIR", "CORE", "MOTOR", "SINGLE", "MINI", "URBAN", "ELECTRIC",
+    "ELECTRICO", "ELÉCTRICO", "HATCH", "AUTOMOVIL", "AUTOMÓVIL",
+    "TECH", "ETECH", "KW", "KWH", "HOME", "CHARGER", "WALLBOX", "VIP",
+    "LIMITED", "STD", "PREMIUM", "EDITION",
+}
+
+
+def _modelo_coherente(modelo_ext, modelo_bd):
+    """Evita Song→Yuan, Kwid→Kangoo, Q4→e-tron 50, Ioniq 5→88 kW."""
+    te = [t for t in _tokens_vehiculo(modelo_ext) if t not in _GENERIC_MODEL_TOKENS]
+    tb = [t for t in _tokens_vehiculo(modelo_bd) if t not in _GENERIC_MODEL_TOKENS]
+    if not te or not tb:
+        return True
+    codes_e = [t for t in te if re.search(r"[A-Z]", t) and re.search(r"\d", t)]
+    for c in codes_e:
+        if not any(c == b or c in b or b in c for b in tb):
+            return False
+    nums_e = [t for t in te if re.fullmatch(r"\d{1,2}", t)]
+    nums_b = [t for t in tb if re.fullmatch(r"\d+", t)]
+    blob_b = " ".join(tb)
+    if nums_e:
+        if not any(n in nums_b or n in blob_b for n in nums_e):
+            return False
+    words_e = [t for t in te if t not in codes_e and not re.fullmatch(r"\d+", t) and len(t) >= 4]
+    words_b = [t for t in tb if not re.fullmatch(r"\d+", t) and len(t) >= 4]
+    if words_e and words_b:
+        for a in words_e:
+            for b in words_b:
+                if a == b or a in b or b in a:
+                    return True
+                if difflib.SequenceMatcher(None, a, b).ratio() >= 0.88:
+                    return True
+        return False
+    return True
 
 
 def buscar_vehiculo_fuzzy(marca_buscada, modelo_buscado, umbral_total=0.90):
@@ -371,22 +506,36 @@ def buscar_vehiculo_fuzzy(marca_buscada, modelo_buscado, umbral_total=0.90):
         tokens_mod_bd = _tokens_vehiculo(mod_bd)
 
         sim_marca = _similitud_nombres(tokens_marca, tokens_marca_bd) if tokens_marca else 0.55
-        sim_mod = _similitud_nombres(tokens_modelo, tokens_mod_bd) if tokens_modelo else 0.0
+        dist_mod = [
+            t for t in tokens_modelo
+            if t not in _GENERIC_MODEL_TOKENS and t not in SUFIJOS_TECNICOS
+        ]
+        dist_bd = [
+            t for t in tokens_mod_bd
+            if t not in _GENERIC_MODEL_TOKENS and t not in SUFIJOS_TECNICOS
+        ]
+        sim_mod = _similitud_nombres(dist_mod, dist_bd) if dist_mod and dist_bd else 0.0
+        if tokens_modelo and not dist_mod:
+            sim_mod = _similitud_nombres(tokens_modelo, tokens_mod_bd)
 
-        for ta in tokens_modelo:
-            for tb in tokens_mod_bd:
+        for ta in dist_mod:
+            for tb in dist_bd:
                 if len(ta) >= 4 and len(tb) >= 4:
                     sim_mod = max(sim_mod, difflib.SequenceMatcher(None, ta, tb).ratio())
                 if 2 <= len(ta) <= 6 and len(tb) >= len(ta) and tb.startswith(ta):
                     sim_mod = max(sim_mod, 0.88)
                 if 2 <= len(tb) <= 6 and len(ta) >= len(tb) and ta.startswith(tb):
                     sim_mod = max(sim_mod, 0.86)
+                if ta == tb and len(ta) >= 3:
+                    sim_mod = max(sim_mod, 0.94)
 
         sim_mod_puro = sim_mod
         sim_combo = _similitud_nombres(tokens_combo, tokens_marca_bd + tokens_mod_bd)
         sim_mod = max(sim_mod, _similitud_nombres(tokens_combo, tokens_mod_bd))
 
         if sim_mod_puro < 0.68 and sim_mod < 0.80:
+            continue
+        if not _modelo_coherente(modelo_txt, mod_bd):
             continue
 
         sim_total = (sim_marca * 0.4) + (sim_mod_puro * 0.6)
@@ -472,7 +621,44 @@ def limpiar_ci(ci_original):
     if not digitos:
         grupos = re.findall(r"\d{8,13}", raw)
         digitos = max(grupos, key=len) if grupos else ""
+    if _ci_es_placeholder(digitos):
+        return ""
     return digitos
+
+
+def _ci_es_placeholder(digitos):
+    s = str(digitos or "")
+    if len(s) < 8:
+        return False
+    if len(set(s)) == 1:
+        return True
+    if s in {"1234567890", "0123456789", "0987654321", "12345678901", "1234567890123"}:
+        return True
+    if s.startswith("123456789"):
+        return True
+    return False
+
+
+def limpiar_beneficiario(nom):
+    s = re.sub(r"\s+", " ", str(nom or "")).strip(" :-|")
+    s = re.sub(
+        r"(?i)^(raz[oó]n\s*social|nombre(?:/raz[oó]n)?(?:\s*social)?|cliente|comprador)\s*:\s*",
+        "",
+        s,
+    )
+    return s.strip(" :-")
+
+
+def _limpiar_campo_vehiculo(val):
+    t = str(val or "")
+    t = re.sub(r"(?i)\bmodelo\s*:\s*", "", t)
+    t = re.sub(r"(?i)\bmarca\s*:\s*", "", t)
+    t = re.sub(r"(?i)\ba[nñ]o\s*:\s*\d{2,4}", "", t)
+    t = re.sub(r"(?i)^(veh[ií]culo|carro|autom[oó]vil|suv)\s+", "", t)
+    t = re.sub(r"(?i)\bi\s*x\s*(\d)", r"iX\1", t)
+    t = re.sub(r"(?i)\bi\s+([345sxy])\b", r"i\1", t)
+    t = re.sub(r"\s+", " ", t).strip(" .;:-")
+    return t
 
 
 def _parece_identificador(texto):
@@ -1015,7 +1201,7 @@ def _reconstruir_total_lineas(texto):
 def _contexto_no_precio(texto, match):
     after = (texto or "")[match.end(): match.end() + 16].lower()
     before = (texto or "")[max(0, match.start() - 40): match.start()].lower()
-    if re.search(r"^\s*(km|kwh|kw|hp|min|ah|cc)\b", after):
+    if re.search(r"^\s*(?:km|kwh|kw|hp|cv|ciclos|vueltas|kg|mm|min|ah|cc|v)\b", after):
         return True
     if re.search(r"(autonom|potencia|bater|tel[eé]fono|p[aá]gina|a[nñ]o modelo)", before):
         return True
@@ -1052,6 +1238,9 @@ def _iter_montos(texto):
 
 def _rol_importe(texto, match, val):
     before = (texto or "")[max(0, match.start() - 110): match.start()]
+    ventana = (texto or "")[max(0, match.start() - 280): match.end() + 80]
+    if _RE_NOTA_FISCAL_CTX.search(ventana) or _RE_NOTA_FISCAL_CTX.search(before):
+        return "pie"
     if _es_contexto_pie(before):
         if re.search(
             r"(?i)(?:valor\s+total|valor\s+a\s+pagar|total\s*a?\s*pagar|monto\s+(?:total|a\s+pagar)|"
@@ -1062,7 +1251,7 @@ def _rol_importe(texto, match, val):
             return "total"
         return "pie"
     tit = _titulo_desde_contexto((texto or "")[max(0, match.start() - 280): match.start()])
-    if tit and _RE_ACCESORIO_CTX.search(tit):
+    if tit and (_RE_ACCESORIO_CTX.search(tit) or _RE_NOTA_FISCAL_CTX.search(tit)):
         return "accesorio"
     if _monto_parece_vehiculo(val):
         return "detalle"
@@ -1146,6 +1335,15 @@ def _partir_nombre_comercial(titulo):
         partes = partes[1:]
     if not partes or _es_placeholder(partes[0]) or not _marca_comercial_ok(partes[0]):
         return None, None
+    conocidos = {_norm_ocr(m) for m, _ in catalogo if m}
+    cabeza = _norm_ocr(partes[0])
+    if conocidos and cabeza not in conocidos:
+        alias = any(
+            cabeza == c or (len(c) >= 3 and len(cabeza) >= 3 and (c.startswith(cabeza) or cabeza.startswith(c)))
+            for c in conocidos
+        )
+        if not alias:
+            return None, None
     if len(partes) == 1:
         return partes[0], None
     modelo = " ".join(partes[1:]).strip(" .;,-")
@@ -1187,7 +1385,8 @@ def _titulo_vehiculo_ok(tit):
         r"(?i)\b(?:garant[ií]as?|condiciones\s+comerciales|precio\s+final|"
         r"impuestos|pol[ií]ticas\s+de|subtotal|liquidaci[oó]n|"
         r"emisiones|costo\s+operativo|dual\s+motor|ahorro\s+operacional|"
-        r"modular\s+scalable)\b",
+        r"modular\s+scalable|datos\s+del|d[oó]lares|transferencia|"
+        r"bancari[ao]|estados\s+unidos|forma\s+de\s+pago|financiamiento)\b",
         t,
     ):
         return False
@@ -1424,6 +1623,54 @@ def extraer_hechos_del_texto(texto):
         hechos["marca"] = prod_m
     if prod_mod and _es_placeholder(hechos.get("modelo")):
         hechos["modelo"] = prod_mod
+    mejor_item = None
+    try:
+        from reportes import extraer_items, item_vehicular_mas_caro
+        items_txt = extraer_items(t)
+        mejor_item = item_vehicular_mas_caro(items_txt)
+    except Exception:
+        items_txt, mejor_item = [], None
+    if mejor_item:
+        pm = str(mejor_item.get("Marca") or "").strip()
+        pmod = str(mejor_item.get("Modelo") or "").strip()
+        if not pm:
+            pm, pmod = _partir_nombre_comercial(mejor_item.get("Descripcion"))
+            pm = (pm or "").strip()
+            pmod = (pmod or str(mejor_item.get("Modelo") or "")).strip()
+        if _marca_comercial_ok(pm):
+            hechos["marca"] = pm
+            if pmod:
+                hechos["modelo"] = pmod
+        elif pmod:
+            hechos["modelo"] = pmod
+        cant_it = mejor_item.get("Cantidad")
+        try:
+            cant_n = int(float(cant_it or 1))
+            if cant_n > 0:
+                hechos["cantidad"] = cant_n
+        except (TypeError, ValueError):
+            pass
+    else:
+        vehiculos = []
+        try:
+            from reportes import extraer_items
+            vehiculos = [
+                it for it in extraer_items(t)
+                if it.get("Categoria_Item") in _CATEGORIAS_VEHICULO
+            ]
+        except Exception:
+            vehiculos = []
+        marca_en_tabla = False
+        token_marca = _norm_ocr(hechos.get("marca"))
+        if len(token_marca) >= 3:
+            marca_en_tabla = any(token_marca in _norm_ocr(it.get("Descripcion")) for it in vehiculos)
+        if vehiculos and not marca_en_tabla:
+            mejor = max(vehiculos, key=lambda it: float(it.get("Valor") or 0))
+            pm, pmod = _partir_nombre_comercial(mejor.get("Descripcion"))
+            if _marca_comercial_ok(pm):
+                hechos["marca"] = pm
+                if pmod:
+                    hechos["modelo"] = pmod
 
     ambito_cat = " ".join(
         x for x in (prod_titulo, hechos.get("marca"), hechos.get("modelo")) if x
@@ -1461,6 +1708,7 @@ def extraer_hechos_del_texto(texto):
         r"total\s+general",
         r"total\s+documento",
         r"importe\s+total",
+        r"monto\s+final",
         r"total\s+(?:factura|proforma|referencial|cotizaci[oó]n|presupuesto)",
         r"precio\s+final",
         r"precio\s+de\s+venta",
@@ -1475,6 +1723,13 @@ def extraer_hechos_del_texto(texto):
         val0 = _monto_tras_etiqueta(t, (etq,), tomar="primero")
         if val0 > 0:
             candidatos_total.append(val0)
+    pago = _monto_tras_etiqueta(
+        t,
+        (r"monto\s+final", r"valor\s+total", r"total\s*a?\s*pagar", r"importe\s+total"),
+        tomar="ultimo",
+    )
+    if pago > 0:
+        candidatos_total = [pago]
 
     neto = _monto_tras_etiqueta(
         t,
@@ -1500,8 +1755,16 @@ def extraer_hechos_del_texto(texto):
         if m_veh:
             neto = parse_costo(m_veh.group(1), reparar_concatenado=False)
     neto_etiqueta = neto
+    neto_item = 0.0
+    if mejor_item:
+        try:
+            neto_item = float(mejor_item.get("Valor") or 0)
+        except (TypeError, ValueError):
+            neto_item = 0.0
     neto_tabla = extraer_maximo_linea_vehiculo(t)
-    if neto_tabla > 0:
+    if neto_item > 0:
+        neto = neto_item
+    elif neto_tabla > 0:
         neto = neto_tabla
     elif neto <= 0 and prod_precio > 0:
         neto = prod_precio
@@ -1523,13 +1786,13 @@ def extraer_hechos_del_texto(texto):
             plaus = [c for c in uniq_tot if _monto_parece_vehiculo(c)]
             total = max(plaus or uniq_tot)
 
-    if total > 0 and neto > 0 and total > neto * 2.2:
+    if total > 0 and neto > 0 and total > neto * 2.2 and neto_item <= 0:
         s = str(int(round(total)))
         if len(s) >= 3:
             alt = parse_costo(s[1:], reparar_concatenado=False)
             if neto * 0.95 <= alt <= neto * 1.6:
                 total = alt
-    if neto > total > 0 and neto > total * 1.12:
+    if neto > total > 0 and neto > total * 1.12 and neto_item <= 0:
         s = str(int(round(neto)))
         if len(s) >= 3:
             alt = parse_costo(s[1:], reparar_concatenado=False)
@@ -1540,7 +1803,7 @@ def extraer_hechos_del_texto(texto):
                 total = recon
     if recon and total and _un_digito_diff(total, recon) and _score_par_montos(neto, recon) >= _score_par_montos(neto, total):
         total = recon
-    if neto > 0 and total > 0 and neto < total * 0.2:
+    if neto_item <= 0 and neto > 0 and total > 0 and neto < total * 0.2:
         neto = 0.0
     if total > 0 and not _monto_parece_vehiculo(total) and recon and _monto_parece_vehiculo(recon):
         total = recon
@@ -1549,10 +1812,11 @@ def extraer_hechos_del_texto(texto):
     venta = _monto_tras_etiqueta(t, (r"precio\s+de\s+venta",), tomar="ultimo")
     if _monto_parece_vehiculo(venta) and venta > total:
         total = venta
-    if total > 0 and 0 < neto < total * 0.45 and _monto_parece_vehiculo(total):
-        neto = total
+    if neto_item > 0:
+        neto = neto_item
     if (
-        neto_etiqueta > 0
+        neto_item <= 0
+        and neto_etiqueta > 0
         and total > 0
         and abs(neto - total) < 1
         and neto_etiqueta < total * 0.98
@@ -1760,21 +2024,19 @@ def evaluar_extraccion(datos):
     else:
         datos["ci"] = ci_limpio
 
-    beneficiario = str(datos.get("beneficiario") or "").strip()
+    beneficiario = limpiar_beneficiario(datos.get("beneficiario"))
     if _es_placeholder(beneficiario) or not _nombre_ok(beneficiario):
         errores.append("Falta beneficiario")
         datos["beneficiario"] = None
     else:
         datos["beneficiario"] = beneficiario
 
-    marca = datos.get("marca")
-    modelo = datos.get("modelo")
-    if _es_placeholder(marca):
-        datos["marca"] = None
-        marca = None
-    if _es_placeholder(modelo):
-        datos["modelo"] = None
-        modelo = None
+    marca = _limpiar_campo_vehiculo(datos.get("marca"))
+    modelo = _limpiar_campo_vehiculo(datos.get("modelo"))
+    datos["marca"] = None if _es_placeholder(marca) else marca
+    datos["modelo"] = None if _es_placeholder(modelo) else modelo
+    marca = datos["marca"]
+    modelo = datos["modelo"]
 
     if marca and datos.get("beneficiario") and str(marca).strip().lower() == str(datos.get("beneficiario")).strip().lower():
         errores.append("Beneficiario parece la marca")
@@ -1798,6 +2060,51 @@ def evaluar_extraccion(datos):
         return False, " | ".join(errores)
 
     return True, "Validación Exitosa"
+
+
+def mover_fragmento(datos, es_valido):
+    """Deja una sola copia en procesados_exito o revision_manual."""
+    nombre = os.path.basename(str(datos.get("archivo_guardado") or ""))
+    if not nombre or nombre in (".", ".."):
+        return
+    destino_dir = CARPETA_EXITOSOS if es_valido else CARPETA_REVISION
+    origen_dir = CARPETA_REVISION if es_valido else CARPETA_EXITOSOS
+    os.makedirs(destino_dir, exist_ok=True)
+    dest = os.path.join(destino_dir, nombre)
+    src = os.path.join(destino_dir, nombre)
+    if not os.path.isfile(src):
+        src = os.path.join(origen_dir, nombre)
+    if not os.path.isfile(src):
+        return
+    if os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dest)):
+        return
+    try:
+        shutil.move(src, dest)
+    except Exception as e:
+        print(f"[WARN] No se movió {nombre}: {e}")
+
+
+def revalidar_registro(datos):
+    """Reglas + catálogo, sin OCR ni LLM. Actualiza estado y carpeta del PDF."""
+    out = dict(datos or {})
+    out["beneficiario"] = limpiar_beneficiario(out.get("beneficiario"))
+    out["ci"] = limpiar_ci(out.get("ci"))
+    out["marca"] = _limpiar_campo_vehiculo(out.get("marca"))
+    out["modelo"] = _limpiar_campo_vehiculo(out.get("modelo"))
+    try:
+        out["cantidad"] = int(float(out.get("cantidad") or 1)) or 1
+    except (TypeError, ValueError):
+        out["cantidad"] = 1
+    es_valido, msj = evaluar_extraccion(out)
+    out["estado"] = "ÉXITO" if es_valido else f"REVISIÓN ({msj})"
+    try:
+        from reportes import tipo_desde_catalogo, estado_excel
+        out["tipo"] = tipo_desde_catalogo(out.get("marca"), out.get("modelo"))
+        out["Estado"] = estado_excel(out)
+    except Exception:
+        pass
+    mover_fragmento(out, es_valido)
+    return serializar_resultado(out)
 
 
 # ==========================================
@@ -1873,23 +2180,6 @@ def es_pagina_nativa(pdf_page):
     return True, texto
 
 
-def extraer_texto_doctr(imagen_pil):
-    from doctr.io import DocumentFile
-
-    img = _imagen_para_ocr(imagen_pil)
-    if img is None:
-        return ""
-    buf = BytesIO()
-    img.save(buf, format="JPEG", quality=85)
-    print("[INFO] DocTR (CPU, puede tardar la primera vez)...")
-    res = get_modelo_doctr()(DocumentFile.from_images(buf.getvalue()))
-    texto = ""
-    for page in res.pages:
-        for block in page.blocks:
-            texto += " ".join([w.value for line in block.lines for w in line.words]) + "\n"
-    return texto.strip()
-
-
 def _imagen_para_ocr(imagen_pil, lado_max=1600):
     if imagen_pil is None:
         return None
@@ -1903,10 +2193,14 @@ def _imagen_para_ocr(imagen_pil, lado_max=1600):
 
 
 def extraer_texto_ocr(imagen_pil):
-    """Un pase Tesseract con timeout. Sin OSD ni DocTR salvo texto casi vacío."""
+    """Un pase Tesseract con timeout."""
     img = _imagen_para_ocr(imagen_pil)
     if img is None:
         return ""
+    try:
+        img = ImageOps.autocontrast(img.convert("L"))
+    except Exception:
+        pass
     print(f"[INFO] Tesseract {img.size[0]}x{img.size[1]}...")
     try:
         texto = pytesseract.image_to_string(img, lang="spa", config="--oem 1 --psm 6", timeout=20) or ""
@@ -1923,16 +2217,37 @@ def extraer_texto_ocr(imagen_pil):
     return (texto or "").strip()
 
 
-TESS_CFG = "--oem 1 --psm 6"
+def _aplicar_ocr_paginas(paginas_data, imagenes_por_idx):
+    pendientes = []
+    for p in paginas_data:
+        if p["es_nativo"]:
+            continue
+        img = imagenes_por_idx.get(p["idx"])
+        p["imagen"] = img
+        if img is not None:
+            pendientes.append(p["idx"])
+    if not pendientes:
+        return
 
+    def _ocr_idx(idx):
+        print(f"[INFO] OCR página {idx + 1}...")
+        return idx, extraer_texto_ocr(imagenes_por_idx[idx])
 
-def _calidad_montos(texto):
-    return len(re.findall(
-        r"(?:\$|USD|US\$)\s*\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{2})?"
-        r"|(?:\$|USD|US\$)\s*\d+[.,]\d{2}",
-        texto or "",
-        flags=re.I,
-    ))
+    resultados = {}
+    workers = min(4, len(pendientes))
+    if workers <= 1:
+        for idx in pendientes:
+            i, texto = _ocr_idx(idx)
+            resultados[i] = texto
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = [pool.submit(_ocr_idx, idx) for idx in pendientes]
+            for fut in as_completed(futs):
+                i, texto = fut.result()
+                resultados[i] = texto
+    for p in paginas_data:
+        if p["idx"] in resultados:
+            p["texto"] = _combinar_textos(p.get("texto") or "", resultados[p["idx"]])
 
 
 def _calidad_ocr(texto):
@@ -1943,27 +2258,6 @@ def _calidad_ocr(texto):
         t,
     ))
     return letras + claves * 25
-
-
-def _ocr_tiene_cliente(texto):
-    t = texto or ""
-    return bool(re.search(
-        r"(?i)(?:nombre|cliente|c\.?\s*i\.?|c[eé]dula|ruc)\s*:",
-        t,
-    )) and bool(re.search(r"[A-ZÁÉÍÓÚÑ][a-záéíóúñ]{2,}", t))
-
-
-def _parece_texto_invertido(texto):
-    """Si al invertir cada palabra aparecen más anclas de factura, el OCR está al revés."""
-    t = texto or ""
-    claves = (
-        r"(?i)\b(?:cliente|proveedor|factura|proforma|nombre|total|marca|"
-        r"modelo|documento|comprador|vendedor|cotizaci[oó]n)\b"
-    )
-    n_ok = len(re.findall(claves, t))
-    invertido = " ".join(w[::-1] for w in re.findall(r"[A-Za-záéíóúñÁÉÍÓÚÑ]{4,}", t))
-    n_inv = len(re.findall(claves, invertido))
-    return n_inv >= 2 and n_inv > n_ok
 
 
 def _combinar_textos(nativo, ocr):
@@ -2053,7 +2347,9 @@ def extraer_con_vision(imagenes_pil, max_reintentos=1):
         + "\nAnaliza la imagen. ci va entre comillas y solo con dígitos de cédula/RUT/RUC, nunca un precio."
         " beneficiario es el comprador: persona o razón social, nunca un RUT ni la marca del vehículo."
     )
-    _liberar_modelo_ollama(MODELO_TEXTO)
+    if not _vram_cabe_ambos():
+        print("[INFO] VRAM justa: se descarga el modelo de texto antes de visión.")
+        _liberar_modelo_ollama(MODELO_TEXTO)
     print(
         f"[INFO] Visión {MODELO_VISION} en GPU. "
         "Más liviano que MiniCPM-V; la primera carga suele ser < 1 min."
@@ -2083,10 +2379,6 @@ def extraer_con_vision(imagenes_pil, max_reintentos=1):
             time.sleep(2)
 
     return {"error": f"{MODELO_VISION} falló en todos los reintentos."}
-
-
-def extraer_con_minicpm(imagenes_pil, max_reintentos=1):
-    return extraer_con_vision(imagenes_pil, max_reintentos=max_reintentos)
 
 
 def requiere_reextraccion(motivo_fallo, es_nativo=True):
@@ -2159,10 +2451,8 @@ def serializar_resultado(datos):
     for k, v in (datos or {}).items():
         if k == "paginas_pdf" and isinstance(v, list):
             limpio[k] = [int(x) for x in v]
-        elif isinstance(v, (np.integer,)):
-            limpio[k] = int(v)
-        elif isinstance(v, (np.floating,)):
-            limpio[k] = float(v)
+        elif hasattr(v, "item") and type(v).__module__.startswith("numpy"):
+            limpio[k] = v.item()
         else:
             limpio[k] = v
     return limpio
@@ -2229,6 +2519,7 @@ def extraer_id_documento(texto):
     cab_plana = re.sub(r"\s+", " ", cab)
     cab_plana = re.sub(r"\s*([-/#])\s*", r"\1", cab_plana)
     patrones = [
+        r"(?i)(?:proforma|cotizaci[oó]n|factura)(?:\s+[A-Za-zÁÉÍÓÚÑáéíóúñ]{3,24}){0,3}\s+([A-Z]{2,10}-\d{2,6}(?:-\d{2,8})+)",
         r"(?i)(?:cotizaci[oó]n|proforma|factura|presupuesto|nota\s+de\s+venta|doc[_\s-]*id)\s*(?:n[°ºo\.]\s*)?[:#]?\s*"
         r"([A-Z][A-Z0-9]{0,12}(?:[-/][A-Z0-9]{1,12}){1,5})",
         r"(?i)(?:\bn[°ºo]\.?|\bno\.?|\bnro\.?|#)\s*[:.]?\s*"
@@ -2249,6 +2540,11 @@ def extraer_id_documento(texto):
                 if re.search(r"(?:rut|ruc|c\.?\s*i\.?|c[eé]dula|nit|dni|tel|cel|fax)\s*:?\s*$", prev):
                     continue
                 val = re.sub(r"\s+", "", m.group(1).replace("–", "-"))
+                digitos = re.sub(r"\D", "", val)
+                if not re.search(r"[A-Za-z]", val) and len(digitos) < 4:
+                    continue
+                if re.fullmatch(r"0\d{2,3}", val):
+                    continue
                 if re.fullmatch(r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}", val):
                     continue
                 if _id_doc_descartable(val):
@@ -2468,7 +2764,7 @@ def guardar_documento_logico(ruta_origen, es_pdf, indices_paginas, ruta_destino)
     return ruta_destino
 
 
-def rasterizar_paginas(ruta_archivo, indices, dpi=180):
+def rasterizar_paginas(ruta_archivo, indices, dpi=220):
     """Convierte solo las páginas que hacen falta (escaneadas o visión)."""
     if not indices:
         return {}
@@ -2486,15 +2782,50 @@ def rasterizar_paginas(ruta_archivo, indices, dpi=180):
     return {i: by_page[i] for i in indices if i in by_page}
 
 
+def _hechos_completos(hechos):
+    if _es_placeholder(hechos.get("marca")) or _es_placeholder(hechos.get("modelo")):
+        return False
+    if _es_placeholder(hechos.get("ci")) or _es_placeholder(hechos.get("beneficiario")):
+        return False
+    score = _score_par_montos(hechos.get("costo_mas_alto"), hechos.get("costo_total"))
+    return score >= 0.8 and _monto_parece_vehiculo(hechos.get("costo_total"))
+
+
+def _alinear_principal(datos, texto):
+    try:
+        from reportes import aplicar_item_principal
+        return aplicar_item_principal(datos, texto)
+    except Exception:
+        return datos
+
+
+def _cma_es_max_vehicular(datos, texto):
+    try:
+        from reportes import extraer_items, item_vehicular_mas_caro
+        princ = item_vehicular_mas_caro(extraer_items(texto, datos))
+        if not princ:
+            return False
+        cma = parse_costo(datos.get("costo_mas_alto"), reparar_concatenado=False)
+        return abs(cma - float(princ.get("Valor") or 0)) <= 1.0
+    except Exception:
+        return False
+
+
 def extraer_y_validar(texto, imagenes_doc, es_nativo):
     """Un LLM de texto + anclas regex. Visión (Qwen2.5-VL 3B) en escaneos si faltan campos o montos."""
     hechos = extraer_hechos_del_texto(texto)
     print(f"[INFO] Hechos anclados del texto: {json.dumps(hechos, ensure_ascii=False, default=str)}")
 
+    if _hechos_completos(hechos):
+        print("[INFO] Anclas completas: se omite Qwen texto.")
+        datos = _alinear_principal(aplicar_hechos({}, hechos), texto)
+        es_valido, msj = evaluar_extraccion(datos)
+        return datos, es_valido, msj
+
     datos = estructurar_con_llm(
         texto, intento_nombre="INTENTO 1 (Qwen texto)", hechos=hechos
     )
-    datos = aplicar_hechos(datos, hechos)
+    datos = _alinear_principal(aplicar_hechos(datos, hechos), texto)
     es_valido, msj = evaluar_extraccion(datos)
     score_montos = _score_par_montos(datos.get("costo_mas_alto"), datos.get("costo_total"))
 
@@ -2518,7 +2849,7 @@ def extraer_y_validar(texto, imagenes_doc, es_nativo):
             motivo_fallo=msj,
             hechos=hechos,
         )
-        datos = aplicar_hechos(fusionar_sin_pisar(datos, datos_2), hechos)
+        datos = _alinear_principal(aplicar_hechos(fusionar_sin_pisar(datos, datos_2), hechos), texto)
         es_valido, msj = evaluar_extraccion(datos)
         falta_id = _es_placeholder(datos.get("marca")) or _es_placeholder(datos.get("modelo"))
         falta_id_o_persona = (
@@ -2534,6 +2865,20 @@ def extraer_y_validar(texto, imagenes_doc, es_nativo):
     if _plantilla_vacia(texto):
         print("[INFO] Plantilla en blanco (campos con guiones). No se llama al modelo de visión.")
         return datos, es_valido, msj
+    if not es_nativo:
+        try:
+            from reportes import extraer_items, item_vehicular_mas_caro
+            items = extraer_items(texto)
+            princ = item_vehicular_mas_caro(items)
+            if (
+                princ
+                and len(items) >= 2
+                and _monto_parece_vehiculo(datos.get("costo_total"))
+                and _cma_es_max_vehicular(datos, texto)
+            ):
+                montos_mal = False
+        except Exception:
+            pass
     necesita_vision = falta_id_o_persona or (not es_nativo and montos_mal)
     if not necesita_vision:
         return datos, es_valido, msj
@@ -2554,6 +2899,7 @@ def extraer_y_validar(texto, imagenes_doc, es_nativo):
             datos["costo_total"] = parse_costo(datos_2.get("costo_total"), reparar_concatenado=False)
         if parse_costo(datos_2.get("costo_mas_alto"), reparar_concatenado=False) > 0:
             datos["costo_mas_alto"] = parse_costo(datos_2.get("costo_mas_alto"), reparar_concatenado=False)
+    datos = _alinear_principal(datos, texto)
     es_valido, msj = evaluar_extraccion(datos)
     return datos, es_valido, msj
 
@@ -2588,6 +2934,11 @@ def procesar_archivo_interno(ruta_archivo):
             "error": str(e),
         }
         yield serializar_resultado(fallo)
+        try:
+            from reportes import anexar_corrida
+            anexar_corrida([serializar_resultado(fallo)])
+        except Exception:
+            pass
         return
 
     if indices_ocr:
@@ -2599,17 +2950,7 @@ def procesar_archivo_interno(ruta_archivo):
                 imagenes_por_idx = {0: Image.open(ruta_archivo).convert("RGB")}
         except Exception as e:
             print(f"[⚠️ Rasterizado falló: {e}]")
-
-        for p in paginas_data:
-            if p["es_nativo"]:
-                continue
-            img = imagenes_por_idx.get(p["idx"])
-            p["imagen"] = img
-            if img is None:
-                continue
-            print(f"[INFO] OCR página {p['idx'] + 1}...")
-            texto = extraer_texto_ocr(img)
-            p["texto"] = _combinar_textos(p.get("texto") or "", texto)
+        _aplicar_ocr_paginas(paginas_data, imagenes_por_idx)
 
     docs_logicos = segmentar_documentos_logicos(paginas_data)
 
@@ -2677,7 +3018,14 @@ def procesar_archivo_interno(ruta_archivo):
             datos_finales["archivo_guardado"] = None
             print(f"[⚠️ No se pudo guardar el fragmento {nombre_frag}]: {e}")
 
+        from reportes import completar_resultado
+        datos_finales = completar_resultado(datos_finales, texto_analizar)
         datos_finales = serializar_resultado(datos_finales)
+        try:
+            from reportes import anexar_corrida
+            anexar_corrida([datos_finales])
+        except Exception as e:
+            print(f"[WARN] No se anexó la corrida ({e}). El documento extraído se conserva.")
         resultados_finales.append(datos_finales)
         yield datos_finales
 
@@ -2690,17 +3038,8 @@ def procesar_archivo_interno(ruta_archivo):
     resultados_exitosos = [r for r in resultados_finales if "ÉXITO" in str(r.get("estado", ""))]
     resultados_fallidos = [r for r in resultados_finales if "REVISIÓN" in str(r.get("estado", ""))]
 
-    if resultados_exitosos:
-        df_exitosos_limpio = [{k: v for k, v in r.items() if k != "paginas_pdf"} for r in resultados_exitosos]
-        df_nuevo = pd.DataFrame(df_exitosos_limpio)
-
-        if os.path.exists(ARCHIVO_EXCEL):
-            df_existente = pd.read_excel(ARCHIVO_EXCEL)
-            df_final = pd.concat([df_existente, df_nuevo], ignore_index=True)
-        else:
-            df_final = df_nuevo
-        df_final.to_excel(ARCHIVO_EXCEL, index=False)
-        print(f"[+] {len(resultados_exitosos)} registro(s) exitoso(s) añadido(s) al Excel.")
+    if resultados_finales:
+        print(f"[+] {len(resultados_exitosos)} éxito(s) y {len(resultados_fallidos)} revisión(es) añadidos a la corrida reciente e histórico.")
 
     if resultados_fallidos:
         with open(ARCHIVO_LOG, "a", encoding="utf-8") as f:
@@ -2712,10 +3051,4 @@ def procesar_archivo_interno(ruta_archivo):
 
 
 if __name__ == "__main__":
-    ruta_ejemplo = "docs/F-0012-I.pdf"
-    if not os.path.exists(ruta_ejemplo):
-        print(f"ERROR: No se encuentra el archivo en {ruta_ejemplo}.")
-    else:
-        resultados = list(procesar_archivo_interno(ruta_ejemplo))
-        print("\n=== RESULTADOS FINALES EN FORMATO JSON ===")
-        print(json.dumps(resultados, indent=4, ensure_ascii=False, default=str))
+    print("ManPAC se arranca con: python api_backend.py")

@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ManPAC — Extractor Automotriz</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <button type="button" class="nav-backdrop" id="nav-backdrop" aria-label="Cerrar menú"></button>
+
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <img class="brand-logo" src="/static/logo-conafips.svg" alt="CONAFIPS">
+      <div>
+        <strong>ManPAC</strong>
+        <small>Extractor automotriz</small>
+      </div>
+    </div>
+    <nav>
+      <button class="nav-btn active" data-view="procesar">Procesar</button>
+      <button class="nav-btn" data-view="reportes">Reportes</button>
+      <button class="nav-btn" data-view="vehiculos">Vehículos</button>
+    </nav>
+    <div class="sidebar-foot">
+      <span id="health" class="pill off">Servidor</span>
+    </div>
+  </aside>
+
+  <main>
+    <header class="topbar">
+      <button type="button" class="menu-btn" id="btn-menu" aria-label="Abrir menú" aria-controls="sidebar" aria-expanded="false">
+        <span></span><span></span><span></span>
+      </button>
+      <div>
+        <h1 id="page-title">Procesar documentos</h1>
+        <p id="page-sub">Selecciona una fila para editar a la derecha y ver el PDF.</p>
+      </div>
+    </header>
+
+    <section id="view-procesar" class="view">
+      <div class="drop" id="dropzone">
+        <input id="file-input" type="file" accept=".pdf,.png,.jpg,.jpeg" multiple>
+        <p><strong>Arrastra archivos aquí</strong> o <label for="file-input">elige en el equipo</label></p>
+        <p class="hint">PDF nativo o escaneado, PNG y JPG. Varios archivos a la vez.</p>
+        <ul id="file-list" class="file-list"></ul>
+        <div class="toolbar">
+          <button type="button" class="btn primary" id="btn-procesar" disabled>Procesar lote</button>
+          <span id="proc-status" class="muted"></span>
+        </div>
+        <div class="progress hidden" id="prog-wrap"><div id="prog-bar"></div></div>
+      </div>
+      <div class="card">
+        <div class="card-head">
+          <h2>Resultados de esta corrida</h2>
+        </div>
+        <div id="live-table"></div>
+      </div>
+    </section>
+
+    <section id="view-reportes" class="view hidden">
+      <div class="tabs">
+        <button class="tab active" data-rep="reciente">Corrida reciente</button>
+        <button class="tab" data-rep="historico">Histórico</button>
+      </div>
+
+      <div id="rep-reciente">
+        <div class="card">
+          <div class="card-head">
+            <h2>Éxitos</h2>
+            <div class="actions">
+              <a class="btn" href="/api/corrida/excel?tipo=exitos">Descargar Excel</a>
+              <button type="button" class="btn primary" id="btn-aceptar">Aceptar en Oracle</button>
+            </div>
+          </div>
+          <div id="tabla-exitos"></div>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <h2>Revisión</h2>
+            <div class="actions">
+              <a class="btn" href="/api/corrida/excel?tipo=revision">Descargar Excel</a>
+            </div>
+          </div>
+          <div id="tabla-revision"></div>
+        </div>
+        <p id="oracle-msg" class="muted"></p>
+      </div>
+
+      <div id="rep-historico" class="hidden">
+        <div class="card">
+          <div class="card-head">
+            <h2>Histórico — éxitos</h2>
+            <div class="actions">
+              <a class="btn" href="/api/historico/excel?tipo=exitos">Descargar Excel</a>
+            </div>
+          </div>
+          <div id="tabla-hist-ex"></div>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <h2>Histórico — revisión</h2>
+            <div class="actions">
+              <a class="btn" href="/api/historico/excel?tipo=revision">Descargar Excel</a>
+            </div>
+          </div>
+          <div id="tabla-hist-re"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="view-vehiculos" class="view hidden">
+      <div class="split">
+        <div class="card">
+          <div class="card-head">
+            <h2>Marcas</h2>
+            <button type="button" class="btn" id="btn-add-marca">Nueva</button>
+          </div>
+          <div id="lista-marcas" class="list"></div>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <h2 id="modelos-title">Modelos</h2>
+            <button type="button" class="btn" id="btn-add-modelo">Nuevo modelo</button>
+          </div>
+          <div id="tabla-modelos"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <aside class="panel-edicion" id="panel-edicion">
+    <button type="button" class="panel-resizer" id="panel-resizer" aria-label="Cambiar ancho del panel" title="Arrastra para cambiar el ancho">
+      <span></span>
+    </button>
+    <div class="panel-empty" id="panel-empty">
+      Selecciona una fila para editar los campos y ver el documento.
+    </div>
+    <div class="panel-body hidden" id="panel-body">
+      <div class="panel-head">
+        <div>
+          <strong id="panel-archivo">Documento</strong>
+          <span id="panel-estado" class="badge warn"></span>
+        </div>
+        <button type="button" class="icon-btn" id="panel-cerrar" aria-label="Cerrar panel">×</button>
+      </div>
+      <form id="panel-form" class="panel-form">
+        <label>Marca<input name="marca" autocomplete="off"></label>
+        <label>Modelo<input name="modelo" autocomplete="off"></label>
+        <label>Cantidad<input name="cantidad" type="number" min="1" step="1"></label>
+        <label>Beneficiario<input name="beneficiario" autocomplete="off"></label>
+        <label>CI / RUC<input name="ci" autocomplete="off"></label>
+        <label>Costo más alto<input name="costo_mas_alto"></label>
+        <label>Costo total<input name="costo_total"></label>
+        <label>Tipo<select name="tipo" id="panel-tipo"></select></label>
+        <div class="panel-items-head">
+          <span>Ítems</span>
+          <button type="button" class="btn" id="btn-item-add">Añadir</button>
+        </div>
+        <div id="panel-items" class="panel-items"></div>
+        <p id="panel-msg" class="muted"></p>
+      </form>
+      <div class="panel-actions">
+        <button type="button" class="btn primary" id="btn-panel-guardar">Guardar y revalidar</button>
+      </div>
+      <div class="panel-pdf-wrap">
+        <iframe id="panel-pdf" title="Visor de documento"></iframe>
+        <img id="panel-img" class="hidden" alt="Documento">
+      </div>
+    </div>
+  </aside>
+
+  <dialog id="dlg">
+    <form method="dialog" id="dlg-form">
+      <h3 id="dlg-title">Formulario</h3>
+      <div id="dlg-body"></div>
+      <div class="dlg-actions">
+        <button type="button" class="btn" id="dlg-cancel">Cancelar</button>
+        <button value="ok" class="btn primary" id="dlg-ok">Guardar</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
